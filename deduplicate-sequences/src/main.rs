@@ -128,7 +128,7 @@ fn write_sequences_to_file(sequences: &[Seq], file_path: &str) -> io::Result<()>
 }
 
 // Function to Deduplicate Sequences
-fn deduplicate_sequences(sequences: Vec<Seq>, num_threads: usize) -> io::Result<Vec<Seq>> {
+fn deduplicate_sequences(sequences: Vec<Seq>, num_threads: usize, similarity: f64) -> io::Result<Vec<Seq>> {
     let length_change_indices: Vec<usize> = sequences
         .windows(2)
         .enumerate()
@@ -142,13 +142,13 @@ fn deduplicate_sequences(sequences: Vec<Seq>, num_threads: usize) -> io::Result<
         .collect();
 
     let total_sequences = sequences.len();
-    let sequences = Arc::new(sequences); // Shared immutable data
+    let sequences = Arc::new(sequences);  // Shared immutable data
     let mut handles = Vec::new();
     
     for thread_id in 0..num_threads {
-        let sequences = Arc::clone(&sequences); // Each thread gets its own Arc reference
+        let sequences = Arc::clone(&sequences);  // Each thread gets its own Arc reference
         let length_change_indices = length_change_indices.clone();
-        
+
         let handle = thread::spawn(move || {
             let mut local_results = Vec::new();
 
@@ -159,11 +159,34 @@ fn deduplicate_sequences(sequences: Vec<Seq>, num_threads: usize) -> io::Result<
                 };
 
                 let current_seq = &sequences[i];
-                if !sequences[next_index..]
-                    .iter()
-                    .any(|s| s.sequence.contains(&current_seq.sequence))
-                {
-                    local_results.push(i);
+
+                if similarity == 100.0 {
+                    if !sequences[next_index..]
+                        .iter()
+                        .any(|s| s.sequence.contains(&current_seq.sequence))
+                    {
+                        local_results.push(i);
+                    }
+                } else {
+                    if !sequences[i + 1..].iter().any(|s| {
+                        let current_len = current_seq.sequence.len();
+                        let candidate_len = s.sequence.len();
+                        let max_mismatches = ((1.0 - similarity / 100.0) * usize::min(current_len, candidate_len) as f64).ceil() as usize;
+
+                        (0..=candidate_len.saturating_sub(current_len))
+                            .any(|start| {
+                                let window = &s.sequence[start..start + current_len];
+                                current_seq
+                                    .sequence
+                                    .chars()
+                                    .zip(window.chars())
+                                    .filter(|(a, b)| a != b)  // Compare each char
+                                    .count() <= max_mismatches
+                            })
+                    })
+                    {
+                        local_results.push(i);
+                    }
                 }
             }
             local_results
@@ -187,14 +210,17 @@ fn main() -> io::Result<()> {
     // Command-line argument handling
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: {} <input_file> <output_file> [num_threads]", args[0]);
+        eprintln!("Usage: {} <input_file> <output_file> <similarity_threshold> [num_threads]", args[0]);
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "Insufficient arguments"));
     }
 
     let input_file = &args[1];
     let output_file = &args[2];
-    let num_threads: usize = if args.len() > 3 {
-        args[3].parse().unwrap_or_else(|_| {
+    let similarity_threshold: f64 = args[3]
+        .parse::<f64>()
+        .expect("Please provide a valid similarity value as a floating-point number.");
+    let num_threads: usize = if args.len() > 4 {
+        args[4].parse::<usize>().unwrap_or_else(|_| {
             eprintln!("Invalid number of threads. Using default value: 4");
             4
         })
@@ -233,7 +259,7 @@ fn main() -> io::Result<()> {
     let adjusted_threads = std::cmp::max(1, std::cmp::min(num_threads, sequences.len() / 10));
     println!("Using {} threads for deduplication.", adjusted_threads);
 
-    let deduplicated_sequences = deduplicate_sequences(sequences, adjusted_threads)?;
+    let deduplicated_sequences = deduplicate_sequences(sequences, adjusted_threads, similarity_threshold)?;
     write_sequences_to_file(&deduplicated_sequences, output_file)?;
 
     println!("Deduplication completed. Output written to '{}'.", output_file);
