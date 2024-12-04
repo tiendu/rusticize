@@ -14,6 +14,31 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 
+
+// File Type
+#[derive(Debug, Clone, Copy)]
+enum FileType {
+    FASTA,
+    FASTQ,
+}
+
+impl FileType {
+    fn from_filename(filename: &str) -> io::Result<Self> {
+        match filename {
+            // Detect the file type from a given filename
+            f if f.ends_with(".fastq.gz") || f.ends_with(".fq.gz") || f.ends_with(".fastq") || f.ends_with(".fq") => Ok(FileType::FASTQ),
+            f if f.ends_with(".fasta") || f.ends_with(".fa") || f.ends_with(".faa") || f.ends_with(".fna") => Ok(FileType::FASTA),
+            _ => {
+                eprintln!("Unrecognized file extension for '{}'.", filename);
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "Unrecognized file extension",
+                ))
+            }
+        }
+    }
+}
+
 // Sequence Struct Definition
 #[derive(Debug, Clone)]
 struct Seq {
@@ -36,7 +61,7 @@ fn hash_string(s: &str) -> u64 {
 }
 
 // Function to Read Sequences from a File
-fn read_sequences(file_path: &str, file_type: &str) -> io::Result<Vec<Seq>> {
+fn read_sequences(file_path: &str, file_type: FileType) -> io::Result<Vec<Seq>> {
     let file = File::open(file_path)?;
     let reader: Box<dyn BufRead> = if file_path.ends_with(".gz") {
         Box::new(BufReader::new(GzDecoder::new(file)))
@@ -48,7 +73,7 @@ fn read_sequences(file_path: &str, file_type: &str) -> io::Result<Vec<Seq>> {
     let mut count = 0;
 
     match file_type {
-        "FASTQ" => {
+        FileType::FASTQ => {
             let mut lines = reader.lines();
             while let (Some(header), Some(seq), Some(_), Some(qual)) = (
                 lines.next(),
@@ -68,7 +93,7 @@ fn read_sequences(file_path: &str, file_type: &str) -> io::Result<Vec<Seq>> {
                 });
             }
         }
-        "FASTA" => {
+        FileType::FASTA => {
             let mut lines = reader.lines().peekable();
             while let Some(header) = lines.next() {
                 let header = header?;
@@ -92,7 +117,6 @@ fn read_sequences(file_path: &str, file_type: &str) -> io::Result<Vec<Seq>> {
                 });
             }
         }
-        _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "Unknown file type")),
     }
 
     println!("Start: {}", count);
@@ -237,18 +261,9 @@ fn main() -> io::Result<()> {
         eprintln!("Error creating output file '{}': {}", output_file, e);
         return Err(e);
     }
-
-    let file_type = if input_file.ends_with(".fastq.gz") || input_file.ends_with(".fq.gz") || input_file.ends_with(".fastq") || input_file.ends_with(".fq") {
-        "FASTQ"
-    } else if input_file.ends_with(".fasta") || input_file.ends_with(".fa") || input_file.ends_with(".faa") || input_file.ends_with(".fna") {
-        "FASTA"
-    } else {
-        eprintln!("Unrecognized file extension for '{}'.", input_file);
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Unrecognized file extension",
-        ));
-    };
+    
+    // Detect file type
+    let file_type = FileType::from_filename(input_file)?;
 
     let sequences = read_sequences(input_file, file_type)?;
     if sequences.is_empty() {
