@@ -65,6 +65,7 @@ fn read_sequences(file_path: &str, file_type: FileType) -> io::Result<Vec<Seq>> 
     } else {
         Box::new(BufReader::new(file))
     };
+    let mut count = 0;
     let mut unique_seqs: HashMap<u64, Seq> = HashMap::new();
     match file_type {
         FileType::FASTQ => {
@@ -84,6 +85,7 @@ fn read_sequences(file_path: &str, file_type: FileType) -> io::Result<Vec<Seq>> 
                     sequence: seq,
                     quality: Some(qual),
                 });
+                count += 1;
             }
         }
         FileType::FASTA => {
@@ -107,11 +109,13 @@ fn read_sequences(file_path: &str, file_type: FileType) -> io::Result<Vec<Seq>> 
                     sequence: seq,
                     quality: None,
                 });
+                count += 1;
             }
         }
     }
     let mut sorted_seqs: Vec<Seq> = unique_seqs.into_values().collect();
     sorted_seqs.sort_by(|a, b| a.length().cmp(&b.length()));
+    println!("Start: {}", count);
     Ok(sorted_seqs)
 }
 
@@ -191,6 +195,7 @@ fn deduplicate_sequences(sequences: Vec<Seq>, num_threads: usize, similarity: f6
                     }
                 }
             }
+            println!("Collecting... {} sequences", local_results.len());
             local_results
         });
         handles.push(handle);
@@ -216,12 +221,23 @@ fn main() -> io::Result<()> {
     let similarity_threshold: f64 = args[3]
         .parse::<f64>()
         .expect("Please provide a valid similarity value as a floating-point number.");
-    let num_threads: usize = if args.len() > 4 {
-        args[4].parse::<usize>().unwrap_or_else(|_| {
-            eprintln!("Invalid number of threads. Using default value: 4");
-            4
-        })
+    let max_cpus = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1); // Fallback to 1 if unavailable
+    let num_threads: usize = if let Some(arg) = args.get(4) {
+        arg.parse::<usize>()
+            .map(|threads| {
+                let adjusted_threads = std::cmp::min(threads, max_cpus);
+                eprintln!("Number of threads: {}", adjusted_threads);
+                adjusted_threads
+            })
+            .unwrap_or_else(|_| {
+                eprintln!("Invalid number of threads. Using default value: 4");
+                4
+            })
     } else {
+        // Default value if args[4] is not provided
+        eprintln!("Number of threads not set. Use default value: 4");
         4
     };
     if !Path::new(input_file).exists() {
@@ -239,10 +255,7 @@ fn main() -> io::Result<()> {
         eprintln!("No sequences detected!");
         return Err(io::Error::new(io::ErrorKind::InvalidData, "No sequences detected"));
     }
-    let adjusted_threads = std::cmp::max(1, std::cmp::min(num_threads, sequences.len() / 10));
-    println!("Using {} threads for deduplication.", adjusted_threads);
-    println!("Start: {}", sequences.len());
-    let deduplicated_sequences = deduplicate_sequences(sequences, adjusted_threads, similarity_threshold)?;
+    let deduplicated_sequences = deduplicate_sequences(sequences, num_threads, similarity_threshold)?;
     println!("End: {}", deduplicated_sequences.len());
     write_sequences_to_file(&deduplicated_sequences, output_file)?;
     Ok(())
