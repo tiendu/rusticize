@@ -39,7 +39,6 @@ impl FileType {
     }
 }
 
-// Sequence Struct Definition
 #[derive(Debug, Clone)]
 struct Seq {
     id: String,
@@ -53,14 +52,12 @@ impl Seq {
     }
 }
 
-// Hash Function for Sequence Deduplication
 fn hash_string(s: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     s.hash(&mut hasher);
     hasher.finish()
 }
 
-// Function to Read Sequences from a File
 fn read_sequences(file_path: &str, file_type: FileType) -> io::Result<Vec<Seq>> {
     let file = File::open(file_path)?;
     let reader: Box<dyn BufRead> = if file_path.ends_with(".gz") {
@@ -68,10 +65,7 @@ fn read_sequences(file_path: &str, file_type: FileType) -> io::Result<Vec<Seq>> 
     } else {
         Box::new(BufReader::new(file))
     };
-    
     let mut unique_seqs: HashMap<u64, Seq> = HashMap::new();
-    let mut count = 0;
-
     match file_type {
         FileType::FASTQ => {
             let mut lines = reader.lines();
@@ -84,7 +78,6 @@ fn read_sequences(file_path: &str, file_type: FileType) -> io::Result<Vec<Seq>> 
                 let header = header?;
                 let seq = seq?;
                 let qual = qual?;
-                count += 1;
                 let seq_hash = hash_string(&seq);
                 unique_seqs.entry(seq_hash).or_insert(Seq {
                     id: header[1..].to_string(),
@@ -108,7 +101,6 @@ fn read_sequences(file_path: &str, file_type: FileType) -> io::Result<Vec<Seq>> 
                     }
                     seq.push_str(lines.next().unwrap()?.trim());
                 }
-                count += 1;
                 let seq_hash = hash_string(&seq);
                 unique_seqs.entry(seq_hash).or_insert(Seq {
                     id: seqid,
@@ -118,16 +110,11 @@ fn read_sequences(file_path: &str, file_type: FileType) -> io::Result<Vec<Seq>> 
             }
         }
     }
-
-    println!("Start: {}", count);
-
     let mut sorted_seqs: Vec<Seq> = unique_seqs.into_values().collect();
     sorted_seqs.sort_by(|a, b| a.length().cmp(&b.length()));
-
     Ok(sorted_seqs)
 }
 
-// Function to Write Sequences to a File
 fn write_sequences_to_file(sequences: &[Seq], file_path: &str) -> io::Result<()> {
     let file = File::create(file_path)?;
     let mut writer: Box<dyn Write> = if file_path.ends_with(".gz") {
@@ -135,7 +122,6 @@ fn write_sequences_to_file(sequences: &[Seq], file_path: &str) -> io::Result<()>
     } else {
         Box::new(file)
     };
-
     for seq in sequences {
         writeln!(
             writer,
@@ -151,7 +137,6 @@ fn write_sequences_to_file(sequences: &[Seq], file_path: &str) -> io::Result<()>
     Ok(())
 }
 
-// Function to Deduplicate Sequences
 fn deduplicate_sequences(sequences: Vec<Seq>, num_threads: usize, similarity: f64) -> io::Result<Vec<Seq>> {
     let length_change_indices: Vec<usize> = sequences
         .windows(2)
@@ -164,28 +149,22 @@ fn deduplicate_sequences(sequences: Vec<Seq>, num_threads: usize, similarity: f6
             }
         })
         .collect();
-
     let total_sequences = sequences.len();
     let sequences = Arc::new(sequences);  // Shared immutable data
     let mut handles = Vec::new();
-    
     for thread_id in 0..num_threads {
         let sequences = Arc::clone(&sequences);  // Each thread gets its own Arc reference
         let length_change_indices = length_change_indices.clone();
-
         let handle = thread::spawn(move || {
             let mut local_results = Vec::new();
-
             for i in (thread_id..total_sequences).step_by(num_threads) {
                 let next_index = match length_change_indices.binary_search(&i) {
                     Ok(idx) => length_change_indices[idx],
                     Err(idx) => length_change_indices.get(idx).copied().unwrap_or(total_sequences),
                 };
-
                 let current_seq = &sequences[i];
-
                 if similarity == 100.0 {
-                    if !sequences[next_index..]
+                    if !sequences[next_index + 1..]
                         .iter()
                         .any(|s| s.sequence.contains(&current_seq.sequence))
                     {
@@ -196,7 +175,6 @@ fn deduplicate_sequences(sequences: Vec<Seq>, num_threads: usize, similarity: f6
                         let current_len = current_seq.sequence.len();
                         let candidate_len = s.sequence.len();
                         let max_mismatches = ((1.0 - similarity / 100.0) * usize::min(current_len, candidate_len) as f64).ceil() as usize;
-
                         (0..=candidate_len.saturating_sub(current_len))
                             .any(|start| {
                                 let window = &s.sequence[start..start + current_len];
@@ -217,19 +195,15 @@ fn deduplicate_sequences(sequences: Vec<Seq>, num_threads: usize, similarity: f6
         });
         handles.push(handle);
     }
-
     // Collect and combine results from threads
     let deduplicated: Vec<Seq> = handles
         .into_iter()
         .flat_map(|handle| handle.join().unwrap())
         .map(|idx| sequences[idx].clone())
         .collect();
-
-    println!("End: {}", deduplicated.len());
     Ok(deduplicated)
 }
 
-// Main Function
 fn main() -> io::Result<()> {
     // Command-line argument handling
     let args: Vec<String> = env::args().collect();
@@ -237,7 +211,6 @@ fn main() -> io::Result<()> {
         eprintln!("Usage: {} <input_file> <output_file> <similarity_threshold> [num_threads]", args[0]);
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "Insufficient arguments"));
     }
-
     let input_file = &args[1];
     let output_file = &args[2];
     let similarity_threshold: f64 = args[3]
@@ -251,33 +224,27 @@ fn main() -> io::Result<()> {
     } else {
         4
     };
-
     if !Path::new(input_file).exists() {
         eprintln!("The input file '{}' does not exist.", input_file);
         return Err(io::Error::new(io::ErrorKind::NotFound, "Input file not found"));
     }
-
     if let Err(e) = File::create(output_file) {
         eprintln!("Error creating output file '{}': {}", output_file, e);
         return Err(e);
     }
-    
     // Detect file type
     let file_type = FileType::from_filename(input_file)?;
-
     let sequences = read_sequences(input_file, file_type)?;
     if sequences.is_empty() {
         eprintln!("No sequences detected!");
         return Err(io::Error::new(io::ErrorKind::InvalidData, "No sequences detected"));
     }
-
     let adjusted_threads = std::cmp::max(1, std::cmp::min(num_threads, sequences.len() / 10));
     println!("Using {} threads for deduplication.", adjusted_threads);
-
+    println!("Start: {}", sequences.len());
     let deduplicated_sequences = deduplicate_sequences(sequences, adjusted_threads, similarity_threshold)?;
+    println!("End: {}", deduplicated_sequences.len());
     write_sequences_to_file(&deduplicated_sequences, output_file)?;
-
-    println!("Deduplication completed. Output written to '{}'.", output_file);
-
     Ok(())
 }
+
