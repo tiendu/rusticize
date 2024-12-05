@@ -7,6 +7,7 @@ use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 use std::sync::{Arc};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 // External Crate Imports
@@ -156,9 +157,11 @@ fn deduplicate_sequences(sequences: Vec<Seq>, num_threads: usize, similarity: f6
     let total_sequences = sequences.len();
     let sequences = Arc::new(sequences);  // Shared immutable data
     let mut handles = Vec::new();
+    let progress = Arc::new(AtomicUsize::new(0)); // Thread-safe counter for progress
     for thread_id in 0..num_threads {
         let sequences = Arc::clone(&sequences);  // Each thread gets its own Arc reference
         let length_change_indices = length_change_indices.clone();
+        let progress = Arc::clone(&progress);
         let handle = thread::spawn(move || {
             let mut local_results = Vec::new();
             for i in (thread_id..total_sequences).step_by(num_threads) {
@@ -194,8 +197,11 @@ fn deduplicate_sequences(sequences: Vec<Seq>, num_threads: usize, similarity: f6
                         local_results.push(i);
                     }
                 }
+                let current_progress = progress.fetch_add(1, Ordering::SeqCst) + 1;
+                if current_progress % 100 == 0 || current_progress == total_sequences {
+                    println!("Progress: {}/{}", current_progress, total_sequences);
+                }
             }
-            println!("Collecting... {} sequences", local_results.len());
             local_results
         });
         handles.push(handle);
