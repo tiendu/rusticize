@@ -1,5 +1,4 @@
 // Standard Library Imports
-use std::collections::HashMap;
 use std::env;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
@@ -95,65 +94,62 @@ fn read_sequences(file_path: &str, file_type: FileType) -> io::Result<Vec<Seq>> 
 }
 
 fn dna_to_bits(dna: &str) -> Vec<u8> {
-    let nucl_to_bits = [
-        ('A', 0b0001),
-        ('T', 0b0010),
-        ('G', 0b0100),
-        ('C', 0b1000),
-        ('W', 0b0011),
-        ('R', 0b0101),
-        ('Y', 0b1010),
-        ('S', 0b1100),
-        ('K', 0b0110),
-        ('M', 0b1001),
-        ('B', 0b1110),
-        ('D', 0b0111),
-        ('H', 0b1011),
-        ('V', 0b1101),
-        ('N', 0b1111),
-    ]
-    .iter()
-    .cloned()
-    .collect::<HashMap<_, _>>();
-    dna.chars()
+    dna.bytes()
         .map(|c| {
-            *nucl_to_bits.get(&c).unwrap_or_else(|| {
-                eprintln!("Invalid base '{}'. Setting to N.", c);
-                &0b1111 // Default to 'N'
-            })
-        })
+            match c {
+                b'A' => 0b0001,
+                b'T' => 0b0010,
+                b'G' => 0b0100,
+                b'C' => 0b1000,
+                b'W' => 0b0011,
+                b'R' => 0b0101,
+                b'Y' => 0b1010,
+                b'S' => 0b1100,
+                b'K' => 0b0110,
+                b'M' => 0b1001,
+                b'B' => 0b1110,
+                b'D' => 0b0111,
+                b'H' => 0b1011,
+                b'V' => 0b1101,
+                b'N' => 0b1111,
+                _ => {
+                    eprintln!("Invalid base '{}'. Setting to N.", c as char);
+                    0b1111
+                }
+            }
+       })
         .collect()
 }
 
-// Reverse complement of a DNA sequence
 fn reverse_complement(dna: &str) -> String {
-    let complement = [
-        ('A', 'T'),
-        ('T', 'A'),
-        ('G', 'C'),
-        ('C', 'G'),
-        ('R', 'Y'),
-        ('Y', 'R'),
-        ('S', 'S'),
-        ('W', 'W'),
-        ('K', 'M'),
-        ('M', 'K'),
-        ('B', 'V'),
-        ('D', 'H'),
-        ('H', 'D'),
-        ('V', 'B'),
-        ('N', 'N'),
-    ]
-    .iter()
-    .cloned()
-    .collect::<HashMap<_, _>>();
-    dna.chars()
+    dna.bytes()
         .rev()
         .map(|c| {
-            *complement.get(&c).unwrap_or_else(|| {
-                eprintln!("Invalid base: '{}'. Setting to N.", c);
-                &'N' // Default to 'N'
-            })
+            match c {
+                b'A' => 'T',
+                b'T' => 'A',
+                b'G' => 'C',
+                b'C' => 'G',
+                b'R' => 'Y',
+                b'Y' => 'R',
+                b'S' => 'S',
+                b'W' => 'W',
+                b'K' => 'M',
+                b'M' => 'K',
+                b'B' => 'V',
+                b'D' => 'H',
+                b'H' => 'D',
+                b'V' => 'B',
+                b'N' => 'N',
+                _ if (c as char).is_ascii() => {
+                    eprintln!("Invalid base '{}'. Setting to N.", c as char);
+                    'N'
+                }
+                _ => {
+                    eprintln!("Non-ASCII character detected. Setting to N.");
+                    'N'
+                },
+            }
         })
         .collect()
 }
@@ -343,7 +339,7 @@ fn compare_sequences(
         handle.join().unwrap();
     }
     // Return the results
-    let mut results_lock = results.lock().unwrap();
+    let results_lock = results.lock().unwrap();
     results_lock.clone()
 }
 
