@@ -281,17 +281,20 @@ fn compare_sequences(
     is_circ: bool,
     num_threads: usize,
 ) -> Vec<(String, String, String, f64, usize, String, String)> {
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
     let seqs1 = Arc::new(seqs1);
     let seqs2 = Arc::new(seqs2);
     let results = Arc::new(Mutex::new(Vec::with_capacity(seqs1.len() * seqs2.len())));
-    let mut handles = Vec::with_capacity(num_threads);
-
-    // We will compare each unique pair of seq1 and seq2 (i < j) to avoid redundant comparisons
+    let progress = Arc::new(Mutex::new(0)); // Progress counter
     let total_combinations = seqs1.len() * seqs2.len();
     let chunk_size = total_combinations / num_threads + 1;
+    let mut handles = Vec::with_capacity(num_threads);
 
     for i in 0..num_threads {
         let results = Arc::clone(&results);
+        let progress = Arc::clone(&progress);
         let seqs1 = Arc::clone(&seqs1);
         let seqs2 = Arc::clone(&seqs2);
         let start_index = i * chunk_size;
@@ -301,9 +304,9 @@ fn compare_sequences(
             let mut local_results = Vec::with_capacity(chunk_size);
 
             for index in start_index..end_index {
-                let seq1 = &seqs1[index / seqs2.len()]; // seq1 comes from seqs1
-                let seq2 = &seqs2[index % seqs2.len()]; // seq2 comes from seqs2
-                println!("{:#?} {:#?}", seq1, seq2);
+                let seq1 = &seqs1[index / seqs2.len()];
+                let seq2 = &seqs2[index % seqs2.len()];
+
                 // Determine which sequence is the pattern and which is the text
                 let (pattern, text) = if seq1.sequence.len() < seq2.sequence.len() {
                     (seq1, seq2)
@@ -323,31 +326,41 @@ fn compare_sequences(
                 );
 
                 for (position, score, mismatch, orientation, topology) in search_results {
-                    // Push the result with the required format including the IDs
                     if pattern.sequence.len() - mismatch
                         >= (text.sequence.len() as f64 * cov_thres).round() as usize
                     {
                         local_results.push((
-                            pattern.id.clone(), // Query ID (from pattern)
-                            text.id.clone(),    // Reference ID (from text)
-                            position,           // Position (start..end)
-                            score,              // Match score
-                            mismatch,           // Number of mismatches
-                            orientation,        // Orientation (forward/reverse)
-                            topology,           // Topology (circular/linear)
-                        ))
-                    };
+                            pattern.id.clone(),
+                            text.id.clone(),
+                            position,
+                            score,
+                            mismatch,
+                            orientation,
+                            topology,
+                        ));
+                    }
+                }
+
+                // Update progress
+                let mut progress_lock = progress.lock().unwrap();
+                *progress_lock += 1;
+                if *progress_lock % 100 == 0 || *progress_lock == total_combinations {
+                    println!("Progress: {}/{}", *progress_lock, total_combinations);
                 }
             }
+
             let mut results_lock = results.lock().unwrap();
             results_lock.extend(local_results);
         });
         handles.push(handle);
     }
+
     // Wait for all threads to complete
     for handle in handles {
         handle.join().unwrap();
     }
+
+    // Return the results
     let results_lock = results.lock().unwrap();
     results_lock.clone()
 }
