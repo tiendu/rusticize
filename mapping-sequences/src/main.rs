@@ -295,7 +295,9 @@ fn search(
 ) -> Vec<(String, String, String, f64, usize, f64, String, String)> {
     let query_seqs = Arc::new(query_seqs);
     let target_seqs = Arc::new(target_seqs);
-    let results = Arc::new(Mutex::new(Vec::new()));
+    let results = Arc::new(Mutex::new(Vec::with_capacity(
+        query_seqs.len() * target_seqs.len(),
+    )));
     let progress = Arc::new(AtomicUsize::new(0));
     let total_combinations = query_seqs.len() * target_seqs.len();
     let chunk_size = total_combinations / num_threads + 1;
@@ -308,7 +310,7 @@ fn search(
         let start_index = thread_id * chunk_size;
         let end_index = std::cmp::min((thread_id + 1) * chunk_size, total_combinations);
         let handle = thread::spawn(move || {
-            let mut local_results = Vec::new();
+            let mut local_results = Vec::with_capacity(chunk_size);
             for index in start_index..end_index {
                 let query = &query_seqs[index / target_seqs.len()];
                 let target = &target_seqs[index % target_seqs.len()];
