@@ -18,29 +18,21 @@ enum FileType {
 
 impl FileType {
     fn from_filename(filename: &str) -> io::Result<Self> {
-        match filename {
-            // Detect the file type from a given filename
-            f if f.ends_with(".fastq.gz")
-                || f.ends_with(".fq.gz")
-                || f.ends_with(".fastq")
-                || f.ends_with(".fq") =>
-            {
-                Ok(FileType::FASTQ)
-            }
-            f if f.ends_with(".fasta")
-                || f.ends_with(".fa")
-                || f.ends_with(".faa")
-                || f.ends_with(".fna") =>
-            {
-                Ok(FileType::FASTA)
-            }
-            _ => {
-                eprintln!("Unrecognized file extension for '{}'.", filename);
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "Unrecognized file extension",
-                ))
-            }
+        let fastq_exts = [".fastq.gz", ".fq.gz", ".fastq", ".fq"];
+        let fasta_exts = [
+            ".fasta", ".fa", ".faa", ".fna",
+            ".fasta.gz", ".fa.gz", ".faa.gz", ".fna.gz",
+        ];
+
+        if fastq_exts.iter().any(|ext| filename.ends_with(ext)) {
+            Ok(FileType::FASTQ)
+        } else if fasta_exts.iter().any(|ext| filename.ends_with(ext)) {
+            Ok(FileType::FASTA)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Unrecognized file extension for '{}'.", filename),
+            ))
         }
     }
 }
