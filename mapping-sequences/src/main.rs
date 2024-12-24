@@ -4,6 +4,7 @@ use std::env;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -23,7 +24,6 @@ impl FileType {
             ".fasta", ".fa", ".faa", ".fna",
             ".fasta.gz", ".fa.gz", ".faa.gz", ".fna.gz",
         ];
-
         if fastq_exts.iter().any(|ext| filename.ends_with(ext)) {
             Ok(FileType::FASTQ)
         } else if fasta_exts.iter().any(|ext| filename.ends_with(ext)) {
@@ -115,7 +115,6 @@ fn dna_to_bits(dna: &str) -> Vec<u8> {
     .iter()
     .cloned()
     .collect::<HashMap<_, _>>();
-
     dna.chars()
         .map(|c| {
             *nucl_to_bits.get(&c).unwrap_or_else(|| {
@@ -148,7 +147,6 @@ fn reverse_complement(dna: &str) -> String {
     .iter()
     .cloned()
     .collect::<HashMap<_, _>>();
-
     dna.chars()
         .rev()
         .map(|c| {
@@ -268,7 +266,6 @@ fn search(
             }
         }
     }
-    println!("{:#?}", matches);
     matches
 }
 
@@ -281,17 +278,13 @@ fn compare_sequences(
     is_circ: bool,
     num_threads: usize,
 ) -> Vec<(String, String, String, f64, usize, String, String)> {
-    use std::sync::{Arc, Mutex};
-    use std::thread;
-
     let seqs1 = Arc::new(seqs1);
     let seqs2 = Arc::new(seqs2);
     let results = Arc::new(Mutex::new(Vec::with_capacity(seqs1.len() * seqs2.len())));
-    let progress = Arc::new(Mutex::new(0)); // Progress counter
+    let progress = Arc::new(AtomicUsize::new(0)); // Progress counter
     let total_combinations = seqs1.len() * seqs2.len();
     let chunk_size = total_combinations / num_threads + 1;
     let mut handles = Vec::with_capacity(num_threads);
-
     for i in 0..num_threads {
         let results = Arc::clone(&results);
         let progress = Arc::clone(&progress);
@@ -299,24 +292,19 @@ fn compare_sequences(
         let seqs2 = Arc::clone(&seqs2);
         let start_index = i * chunk_size;
         let end_index = std::cmp::min((i + 1) * chunk_size, total_combinations);
-
         let handle = thread::spawn(move || {
             let mut local_results = Vec::with_capacity(chunk_size);
-
             for index in start_index..end_index {
                 let seq1 = &seqs1[index / seqs2.len()];
                 let seq2 = &seqs2[index % seqs2.len()];
-
                 // Determine which sequence is the pattern and which is the text
                 let (pattern, text) = if seq1.sequence.len() < seq2.sequence.len() {
                     (seq1, seq2)
                 } else {
                     (seq2, seq1)
                 };
-
                 // Calculate the tolerance based on similarity threshold
-                let tolerance = (sim_thres * pattern.sequence.len() as f64).round() as usize;
-
+                let tolerance = (pattern.sequence.len() as f64 - sim_thres * pattern.sequence.len() as f64).round() as usize;
                 let search_results = search(
                     &text.sequence,
                     &pattern.sequence,
@@ -324,7 +312,6 @@ fn compare_sequences(
                     is_circ,
                     tolerance,
                 );
-
                 for (position, score, mismatch, orientation, topology) in search_results {
                     if pattern.sequence.len() - mismatch
                         >= (text.sequence.len() as f64 * cov_thres).round() as usize
@@ -340,28 +327,23 @@ fn compare_sequences(
                         ));
                     }
                 }
-
                 // Update progress
-                let mut progress_lock = progress.lock().unwrap();
-                *progress_lock += 1;
-                if *progress_lock % 100 == 0 || *progress_lock == total_combinations {
-                    println!("Progress: {}/{}", *progress_lock, total_combinations);
+                let current_progress = progress.fetch_add(1, Ordering::Relaxed) + 1;
+                if current_progress % 100 == 0 || current_progress == total_combinations {
+                    println!("Progress: {}/{}", current_progress, total_combinations);
                 }
             }
-
             let mut results_lock = results.lock().unwrap();
             results_lock.extend(local_results);
         });
         handles.push(handle);
     }
-
     // Wait for all threads to complete
     for handle in handles {
         handle.join().unwrap();
     }
-
     // Return the results
-    let results_lock = results.lock().unwrap();
+    let mut results_lock = results.lock().unwrap();
     results_lock.clone()
 }
 
@@ -426,10 +408,10 @@ fn main() -> io::Result<()> {
         eprintln!("Error creating output file '{}': {}", output_file, e);
         return Err(e);
     }
-    let file1_type = FileType::from_filename(input_file1)?;
-    let file2_type = FileType::from_filename(input_file2)?;
-    let sequences1 = read_sequences(input_file1, file1_type)?;
-    let sequences2 = read_sequences(input_file2, file2_type)?;
+    let input_file1_type = FileType::from_filename(input_file1)?;
+    let input_file2_type = FileType::from_filename(input_file2)?;
+    let sequences1 = read_sequences(input_file1, input_file1_type)?;
+    let sequences2 = read_sequences(input_file2, input_file2_type)?;
     if sequences1.is_empty() {
         eprintln!("No sequences detected!");
         return Err(io::Error::new(
