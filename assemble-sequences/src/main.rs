@@ -1,72 +1,79 @@
-use std::collections::{BTreeMap, HashSet};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::collections::{HashMap, HashSet};
 
-fn build_de_bruijn_graph_for_read(read: &String, k: usize) -> BTreeMap<String, Vec<String>> {
-    let mut graph: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for i in 0..=read.len() - k {
-        let kmer = &read[i..i + k];
-        let prefix = &kmer[..k - 1];
-        let suffix = &kmer[1..];
-        graph
-            .entry(prefix.to_string())
-            .or_insert_with(Vec::new)
-            .push(suffix.to_string());
+fn build_de_bruijn_graph(reads: &[String], k: usize) -> HashMap<String, Vec<String>> {
+    let mut graph: HashMap<String, Vec<String>> = HashMap::new();
+    for read in reads {
+        for i in 0..=read.len() - k {
+            let kmer = &read[i..i + k];
+            let prefix = &kmer[..k - 1];
+            let suffix = &kmer[1..];
+            graph
+                .entry(prefix.to_string())
+                .or_insert_with(Vec::new)
+                .push(suffix.to_string());
+        }
     }
     graph
 }
 
-fn generate_contigs(graph: &BTreeMap<String, Vec<String>>, k: usize) -> Vec<String> {
+fn generate_contigs(graph: &HashMap<String, Vec<String>>, k: usize) -> Vec<String> {
     let mut contigs = Vec::new();
-    let mut seen_contigs = HashSet::new();
-
-    for prefix in graph.keys() {
-        let mut path = vec![prefix];
-        let mut current_node = prefix;
-
-        loop {
-            if let Some(suffixes) = graph.get(current_node) {
-                if suffixes.is_empty() {
-                    break; // No outgoing edges, dead-end, break the loop
-                }
+    let mut visited_edges: HashSet<(String, String)> = HashSet::new();
+    // Determine incoming edges for each node
+    let incoming_edges: HashMap<&String, usize> = graph
+        .values()
+        .flat_map(|suffixes| suffixes.iter())
+        .fold(HashMap::new(), |mut acc, suffix| {
+            *acc.entry(suffix).or_insert(0) += 1;
+            acc
+        });
+    // Identify start nodes
+    let mut start_nodes: Vec<String> = graph
+        .keys()
+        .filter(|node| !incoming_edges.contains_key(*node))
+        .cloned()
+        .collect();
+    // Sort start nodes for consistent traversal
+    start_nodes.sort();
+    // Helper to build a contig from a path
+    let build_contig = |path: &[String]| -> String {
+        path.iter()
+            .skip(1) // Skip the first node since it is already included as the base
+            .fold(path[0].clone(), |mut contig, node| {
+                // For each subsequent node in the path, append its unique suffix (k-1 overlapping portion)
+                contig.push_str(&node[k - 1..]);
+                contig
+            })
+    };
+    // Traverse the graph starting from each node
+    for start_node in start_nodes {
+        let mut stack = vec![start_node.clone()];
+        let mut path = Vec::new();
+        while let Some(current_node) = stack.pop() {
+            path.push(current_node.clone());
+            if let Some(suffixes) = graph.get(&current_node) {
+                let mut sorted_suffixes = suffixes.clone();
+                sorted_suffixes.sort();
                 let mut extended = false;
-                for suffix in suffixes {
-                    path.push(suffix);
-                    current_node = suffix;
-                    extended = true;
-                    break;
+                for suffix in sorted_suffixes {
+                    let edge = (current_node.clone(), suffix.clone());
+                    if !visited_edges.contains(&edge) {
+                        visited_edges.insert(edge);
+                        stack.push(suffix.clone());
+                        extended = true;
+                    }
                 }
                 if !extended {
-                    break;
+                    contigs.push(build_contig(&path));
+                    path.pop(); // Backtrack
                 }
             } else {
-                break;
-            }
-        }
-
-        if path.len() > 1 {
-            let mut contig = path[0].to_string();
-            for node in &path[1..] {
-                contig.push_str(&node[k - 1..]);
-            }
-
-            if contig.len() > k + 1 && !is_substring_of_existing(&contig, &seen_contigs) {
-                contigs.push(contig.clone());
-                seen_contigs.insert(contig);
+                contigs.push(build_contig(&path));
+                path.pop(); // Backtrack
             }
         }
     }
-    println!("{:#?}", seen_contigs);
     contigs
-}
-
-fn is_substring_of_existing(contig: &str, seen_contigs: &HashSet<String>) -> bool {
-    for existing in seen_contigs {
-        if existing.contains(contig) {
-            return true;
-        }
-    }
-    false
 }
 
 fn main() {
@@ -75,60 +82,21 @@ fn main() {
         "ATGCT".to_string(),
         "TGCTTA".to_string(),
         "CTTACC".to_string(),
+        "AAATAT".to_string(),
     ];
-
-    let mut sorted_reads = reads.clone();
-    sorted_reads.sort_by(|a, b| {
-        let len_cmp = b.len().cmp(&a.len());
-        if len_cmp == std::cmp::Ordering::Equal {
-            a.cmp(b) // Lexicographic sorting for equal length
-        } else {
-            len_cmp
-        }
-    });
+    println!("Reads:");
+    for read in &reads {
+        println!("{}", read);
+    }
 
     let k = 4; // k-mer size
-    let num_threads = 2; // Fixed number of threads
-    let chunk_size = (sorted_reads.len() + num_threads - 1) / num_threads; // Calculate chunk size
-
-    // Split the sorted reads into chunks
-    let chunks: Vec<Vec<String>> = sorted_reads
-        .chunks(chunk_size)
-        .map(|chunk| chunk.to_vec())
-        .collect();
-
-    // Initialize the shared graph
-    let graph = Arc::new(Mutex::new(BTreeMap::new()));
-    let mut handles = vec![];
-
-    // Spawn a thread for each chunk of reads
-    for chunk in chunks {
-        let graph = Arc::clone(&graph);
-        let handle = thread::spawn(move || {
-            for read in chunk {
-                let local_graph = build_de_bruijn_graph_for_read(&read, k);
-                let mut graph = graph.lock().unwrap();
-                for (prefix, suffixes) in local_graph {
-                    graph
-                        .entry(prefix)
-                        .or_insert_with(Vec::new)
-                        .extend(suffixes);
-                }
-            }
-        });
-        handles.push(handle);
+    let dbg = build_de_bruijn_graph(&reads, k);
+    println!("De Bruijn Graph:");
+    for (node, edges) in &dbg {
+        println!("{} -> {:?}", node, edges);
     }
 
-    // Wait for all threads to finish building the graph
-    for handle in handles {
-        handle.join().unwrap();
-    }
-
-    // Once all threads finish, generate contigs using the graph
-    let graph = graph.lock().unwrap();
-    let contigs = generate_contigs(&graph, k - 1);
-
-    println!("Generated Contigs:");
+    let contigs = generate_contigs(&dbg, k - 1);
     for contig in contigs {
         println!("{}", contig);
     }
