@@ -75,7 +75,6 @@ fn generate_contigs(graph: &HashMap<String, Vec<String>>, k: usize) -> Vec<Strin
     }
     contigs
 }
-
 fn main() {
     let reads = vec![
         "TTAGGG".to_string(),
@@ -84,19 +83,64 @@ fn main() {
         "CTTACC".to_string(),
         "AAATAT".to_string(),
     ];
-    println!("Reads:");
-    for read in &reads {
-        println!("{}", read);
-    }
-
     let k = 4; // k-mer size
-    let dbg = build_de_bruijn_graph(&reads, k);
+    let max_cpus = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1); // Fallback to 1 if unavailable
+    let num_threads = 4;
+    let chunk_size = (reads.len() + num_threads - 1) / num_threads;
+    let reads_chunks: Vec<_> = reads.chunks(chunk_size).map(|chunk| chunk.to_vec()).collect();
+    let graph = Arc::new(Mutex::new(HashMap::new()));
+    let mut handles = Vec::new();
+    for chunk in reads_chunks {
+        let graph_clone = Arc::clone(&graph);
+        let handle = thread::spawn(move || {
+            let local_graph = build_de_bruijn_graph_single_thread(&chunk, k);
+            let mut global_graph = graph_clone.lock().unwrap();
+            for (prefix, suffixes) in local_graph {
+                global_graph
+                    .entry(prefix)
+                    .or_insert_with(Vec::new)
+                    .extend(suffixes);
+            }
+        });
+        handles.push(handle);
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    let graph = Arc::try_unwrap(graph).unwrap().into_inner().unwrap();
     println!("De Bruijn Graph:");
-    for (node, edges) in &dbg {
+    for (node, edges) in &graph {
         println!("{} -> {:?}", node, edges);
     }
-
-    let contigs = generate_contigs(&dbg, k - 1);
+    let graph = Arc::new(graph);
+    let contigs = Arc::new(Mutex::new(Vec::new()));
+    let start_nodes: Vec<String> = graph
+        .keys()
+        .filter(|node| !graph
+            .values()
+            .flat_map(|suffixes| suffixes.iter())
+            .any(|suffix| suffix == *node))
+        .cloned()
+        .collect();
+    let chunk_size = (start_nodes.len() + num_threads - 1) / num_threads;
+    let start_chunks: Vec<_> = start_nodes.chunks(chunk_size).map(|chunk| chunk.to_vec()).collect();
+    let mut handles = Vec::new();
+    for chunk in start_chunks {
+        let graph_clone = Arc::clone(&graph);
+        let contigs_clone = Arc::clone(&contigs);
+        let handle = thread::spawn(move || {
+            let local_contigs = generate_contigs_single_thread(&graph_clone, k - 1);
+            contigs_clone.lock().unwrap().extend(local_contigs);
+        });
+        handles.push(handle);
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    let contigs = Arc::try_unwrap(contigs).unwrap().into_inner().unwrap();
+    println!("Contigs:");
     for contig in contigs {
         println!("{}", contig);
     }
