@@ -1,6 +1,116 @@
 use std::collections::{HashMap, HashSet};
+use std::env;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Write};
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::thread;
+
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
+
+#[derive(Debug, Clone, Copy)]
+enum FileType {
+    FASTA,
+    FASTQ,
+}
+
+impl FileType {
+    fn from_filename(filename: &str) -> io::Result<Self> {
+        let fastq_exts = [".fastq.gz", ".fq.gz", ".fastq", ".fq"];
+        let fasta_exts = [
+            ".fasta",
+            ".fa",
+            ".faa",
+            ".fna",
+            ".fasta.gz",
+            ".fa.gz",
+            ".faa.gz",
+            ".fna.gz",
+        ];
+        if fastq_exts.iter().any(|ext| filename.ends_with(ext)) {
+            Ok(FileType::FASTQ)
+        } else if fasta_exts.iter().any(|ext| filename.ends_with(ext)) {
+            Ok(FileType::FASTA)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Unrecognized file extension for '{}'.", filename),
+            ))
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Seq {
+    id: String,
+    sequence: String,
+    quality: Option<String>,
+}
+
+fn read_sequences(file_path: &str, file_type: FileType) -> io::Result<Vec<Seq>> {
+    let file = File::open(file_path)?;
+    let reader: Box<dyn BufRead> = if file_path.ends_with(".gz") {
+        Box::new(BufReader::new(GzDecoder::new(file)))
+    } else {
+        Box::new(BufReader::new(file))
+    };
+    let mut seqs: Vec<Seq> = Vec::new();
+    match file_type {
+        FileType::FASTQ => {
+            let mut lines = reader.lines();
+            while let (Some(header), Some(seq), Some(_), Some(qual)) =
+                (lines.next(), lines.next(), lines.next(), lines.next())
+            {
+                let header = header?;
+                let seq = seq?;
+                let qual = qual?;
+                seqs.push(Seq {
+                    id: header[1..].to_string(),
+                    sequence: seq,
+                    quality: Some(qual),
+                });
+            }
+        }
+        FileType::FASTA => {
+            let mut lines = reader.lines().peekable();
+            while let Some(header) = lines.next() {
+                let header = header?;
+                if !header.starts_with('>') {
+                    continue; // Skip invalid headers
+                }
+                let seqid = header[1..].to_string();
+                let mut seq = String::new();
+                while let Some(Ok(line)) = lines.peek() {
+                    if line.starts_with('>') {
+                        break;
+                    }
+                    seq.push_str(lines.next().unwrap()?.trim());
+                }
+                seqs.push(Seq {
+                    id: seqid,
+                    sequence: seq,
+                    quality: None,
+                });
+            }
+        }
+    }
+    Ok(seqs)
+}
+
+fn write_sequences_to_file(sequences: &[String], file_path: &str) -> io::Result<()> {
+    let file = File::create(file_path)?;
+    let mut writer: Box<dyn Write> = if file_path.ends_with(".gz") {
+        Box::new(GzEncoder::new(file, Compression::default()))
+    } else {
+        Box::new(file)
+    };
+    for (i, seq) in sequences.iter().enumerate() {
+        writeln!(writer, ">{}\n{}", format!("Contig_{}", i), seq)?;
+    }
+    Ok(())
+}
 
 fn build_de_bruijn_graph(reads: &[String], k: usize) -> HashMap<String, Vec<String>> {
     let mut graph: HashMap<String, Vec<String>> = HashMap::new();
@@ -18,7 +128,7 @@ fn build_de_bruijn_graph(reads: &[String], k: usize) -> HashMap<String, Vec<Stri
     graph
 }
 
-fn generate_contigs(
+fn generate_contigs_from_graph(
     graph: &RwLock<HashMap<String, Vec<String>>>,
     k: usize,
     start_nodes: Vec<String>,
@@ -35,7 +145,6 @@ fn generate_contigs(
                 contig
             })
     };
-
     // Traverse the graph starting from each node in the chunk
     for start_node in start_nodes {
         let mut stack = vec![start_node.clone()];
@@ -68,28 +177,15 @@ fn generate_contigs(
     contigs
 }
 
-fn main() {
-    let reads = vec![
-        "TTAGGG".to_string(),
-        "ATGCT".to_string(),
-        "TGCTTA".to_string(),
-        "CTTACC".to_string(),
-        "AAATAT".to_string(),
-        "AAATAC".to_string(),
-    ];
-    let k = 4; // k-mer size
-    let max_cpus = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1); // Fallback to 1 if unavailable
-    let num_threads = 4;
-    let chunk_size = (reads.len() + num_threads - 1) / num_threads;
-    let reads_chunks: Vec<_> = reads
+fn construct_contigs(sequences: Vec<String>, k: usize, num_threads: usize) -> Vec<String> {
+    let chunk_size = (sequences.len() + num_threads - 1) / num_threads;
+    let sequence_chunks: Vec<_> = sequences
         .chunks(chunk_size)
         .map(|chunk| chunk.to_vec())
         .collect();
     let graph = Arc::new(RwLock::new(HashMap::new()));
     let mut handles = Vec::new();
-    for chunk in reads_chunks {
+    for chunk in sequence_chunks {
         let graph_clone = Arc::clone(&graph);
         let handle = thread::spawn(move || {
             let local_graph = build_de_bruijn_graph(&chunk, k);
@@ -106,13 +202,11 @@ fn main() {
     for handle in handles {
         handle.join().unwrap();
     }
-
     let graph_read = graph.read().unwrap(); // Acquire read lock
     println!("De Bruijn Graph:");
     for (node, edges) in &*graph_read {
         println!("{} -> {:?}", node, edges);
     }
-
     let contigs = Arc::new(RwLock::new(Vec::new()));
     let start_nodes: Vec<String> = graph_read
         .keys()
@@ -120,12 +214,17 @@ fn main() {
             // For each node, check if it has no incoming edges (i.e., it's not a suffix of any other node)
             !graph_read
                 .values()
-                .flat_map(|suffixes| suffixes.iter())
-                .any(|suffix| suffix == *node)
+                .any(|suffixes| suffixes.iter().any(|suffix| suffix == *node))
         })
         .cloned()
         .collect();
-    let chunk_size = (start_nodes.len() + num_threads - 1) / num_threads;
+    println!("start_nodes {:#?}", start_nodes);
+    let chunk_size = if start_nodes.len() > 0 {
+        (start_nodes.len() + num_threads - 1) / num_threads
+    } else {
+        1 // Default to 1 if there are no start nodes
+    };
+    println!("{}", chunk_size);
     let start_chunks: Vec<_> = start_nodes
         .chunks(chunk_size)
         .map(|chunk| chunk.to_vec())
@@ -135,7 +234,7 @@ fn main() {
         let graph_clone = Arc::clone(&graph);
         let contigs_clone = Arc::clone(&contigs);
         let handle = thread::spawn(move || {
-            let local_contigs = generate_contigs(&graph_clone, k - 1, chunk);
+            let local_contigs = generate_contigs_from_graph(&graph_clone, k - 1, chunk);
             contigs_clone.write().unwrap().extend(local_contigs); // Acquire write lock
         });
         handles.push(handle);
@@ -148,4 +247,44 @@ fn main() {
     for contig in &*contigs_read {
         println!("{}", contig);
     }
+    (*contigs_read).clone()
+}
+
+fn main() -> io::Result<()> {
+    // Command-line argument handling
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 2 {
+        eprintln!(
+            "Usage: {} <input_file> <output_file> [k] [num_threads]",
+            args[0]
+        );
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Insufficient arguments",
+        ));
+    }
+    let input_file = &args[1];
+    let output_file = &args[2];
+    if !Path::new(input_file).exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "Input file not found",
+        ));
+    }
+    let k: usize = args
+        .get(3)
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(55);
+    let available_threads = thread::available_parallelism().map_or(1, |n| n.get());
+    let num_threads = std::cmp::min(
+        available_threads,
+        args.get(4)
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(4),
+    );
+    let sequences = read_sequences(input_file, FileType::from_filename(&input_file)?)?;
+    let unique_sequences: HashSet<String> = sequences.into_iter().map(|s| s.sequence).collect();
+    let contigs = construct_contigs(Vec::from_iter(unique_sequences.into_iter()), k, num_threads);
+    write_sequences_to_file(&contigs, output_file)?;
+    Ok(())
 }
