@@ -3,7 +3,10 @@ use std::env;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, RwLock,
+};
 use std::thread;
 
 use flate2::read::GzDecoder;
@@ -177,16 +180,19 @@ fn generate_contigs_from_graph(
     contigs
 }
 
-fn construct_contigs(sequences: Vec<String>, k: usize, num_threads: usize) -> Vec<String> {
+fn process_reads_to_contigs(sequences: Vec<String>, k: usize, num_threads: usize) -> Vec<String> {
     let chunk_size = (sequences.len() + num_threads - 1) / num_threads;
     let sequence_chunks: Vec<_> = sequences
         .chunks(chunk_size)
         .map(|chunk| chunk.to_vec())
         .collect();
     let graph = Arc::new(RwLock::new(HashMap::new()));
+    let total_chunks = sequence_chunks.len();
+    let progress = Arc::new(AtomicUsize::new(0));
     let mut handles = Vec::new();
     for chunk in sequence_chunks {
         let graph_clone = Arc::clone(&graph);
+        let progress_clone = Arc::clone(&progress);
         let handle = thread::spawn(move || {
             let local_graph = build_de_bruijn_graph(&chunk, k);
             let mut global_graph = graph_clone.write().unwrap(); // Acquire write lock
@@ -196,6 +202,11 @@ fn construct_contigs(sequences: Vec<String>, k: usize, num_threads: usize) -> Ve
                     .or_insert_with(Vec::new)
                     .extend(suffixes);
             }
+            let completed = progress_clone.fetch_add(1, Ordering::Relaxed) + 1;
+            println!(
+                "Graph construction progress: {}/{}",
+                completed, total_chunks
+            );
         });
         handles.push(handle);
     }
@@ -203,10 +214,6 @@ fn construct_contigs(sequences: Vec<String>, k: usize, num_threads: usize) -> Ve
         handle.join().unwrap();
     }
     let graph_read = graph.read().unwrap(); // Acquire read lock
-    println!("De Bruijn Graph:");
-    for (node, edges) in &*graph_read {
-        println!("{} -> {:?}", node, edges);
-    }
     let contigs = Arc::new(RwLock::new(Vec::new()));
     let start_nodes: Vec<String> = graph_read
         .keys()
@@ -218,24 +225,30 @@ fn construct_contigs(sequences: Vec<String>, k: usize, num_threads: usize) -> Ve
         })
         .cloned()
         .collect();
-    println!("start_nodes {:#?}", start_nodes);
     let chunk_size = if start_nodes.len() > 0 {
         (start_nodes.len() + num_threads - 1) / num_threads
     } else {
         1 // Default to 1 if there are no start nodes
     };
-    println!("{}", chunk_size);
     let start_chunks: Vec<_> = start_nodes
         .chunks(chunk_size)
         .map(|chunk| chunk.to_vec())
         .collect();
+    let total_start_chunks = start_chunks.len();
+    let progress = Arc::new(AtomicUsize::new(0));
     let mut handles = Vec::new();
     for chunk in start_chunks {
         let graph_clone = Arc::clone(&graph);
         let contigs_clone = Arc::clone(&contigs);
+        let progress_clone = Arc::clone(&progress);
         let handle = thread::spawn(move || {
             let local_contigs = generate_contigs_from_graph(&graph_clone, k - 1, chunk);
             contigs_clone.write().unwrap().extend(local_contigs); // Acquire write lock
+            let completed = progress_clone.fetch_add(1, Ordering::Relaxed) + 1;
+            println!(
+                "Contig generation progress: {}/{}",
+                completed, total_start_chunks
+            );
         });
         handles.push(handle);
     }
@@ -243,10 +256,6 @@ fn construct_contigs(sequences: Vec<String>, k: usize, num_threads: usize) -> Ve
         handle.join().unwrap();
     }
     let contigs_read = contigs.read().unwrap(); // Acquire read lock
-    println!("Contigs:");
-    for contig in &*contigs_read {
-        println!("{}", contig);
-    }
     (*contigs_read).clone()
 }
 
@@ -284,7 +293,8 @@ fn main() -> io::Result<()> {
     );
     let sequences = read_sequences(input_file, FileType::from_filename(&input_file)?)?;
     let unique_sequences: HashSet<String> = sequences.into_iter().map(|s| s.sequence).collect();
-    let contigs = construct_contigs(Vec::from_iter(unique_sequences.into_iter()), k, num_threads);
+    let contigs =
+        process_reads_to_contigs(Vec::from_iter(unique_sequences.into_iter()), k, num_threads);
     write_sequences_to_file(&contigs, output_file)?;
     Ok(())
 }
