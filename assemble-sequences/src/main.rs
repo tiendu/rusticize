@@ -124,8 +124,12 @@ fn build_de_bruijn_graph(reads: &[String], k: usize) -> HashMap<String, Vec<Stri
             let suffix = &kmer[1..];
             graph
                 .entry(prefix.to_string())
-                .or_insert_with(Vec::new)
-                .push(suffix.to_string());
+                .and_modify(|suffixes| {
+                    if !suffixes.contains(&suffix.to_string()) {
+                        suffixes.push(suffix.to_string());
+                    }
+                })
+                .or_insert_with(|| vec![suffix.to_string()]);
         }
     }
     graph
@@ -199,8 +203,14 @@ fn process_reads_to_contigs(sequences: Vec<String>, k: usize, num_threads: usize
             for (prefix, suffixes) in local_graph {
                 global_graph
                     .entry(prefix)
-                    .or_insert_with(Vec::new)
-                    .extend(suffixes);
+                    .and_modify(|existing_suffixes: &mut Vec<_>| {
+                        for suffix in &suffixes {
+                            if !existing_suffixes.contains(suffix) {
+                                existing_suffixes.push(suffix.to_owned());
+                            }
+                        }
+                    })
+                    .or_insert_with(|| suffixes.clone());
             }
             let completed = progress_clone.fetch_add(1, Ordering::Relaxed) + 1;
             println!(
