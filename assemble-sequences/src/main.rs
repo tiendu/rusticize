@@ -185,24 +185,27 @@ fn generate_contigs_from_graph(
 }
 
 fn process_reads_to_contigs(sequences: Vec<String>, k: usize, num_threads: usize) -> Vec<String> {
-    let chunk_size = (sequences.len() + num_threads - 1) / num_threads;
+    let chunk_size = (sequences.len() + num_threads - 1) / (num_threads * 10);
     let sequence_chunks: Vec<_> = sequences
         .chunks(chunk_size)
         .map(|chunk| chunk.to_vec())
         .collect();
     let graph = Arc::new(RwLock::new(HashMap::new()));
+    let start_nodes = Arc::new(RwLock::new(HashSet::new()));
     let total_chunks = sequence_chunks.len();
     let progress = Arc::new(AtomicUsize::new(0));
     let mut handles = Vec::new();
     for chunk in sequence_chunks {
         let graph_clone = Arc::clone(&graph);
+        let start_nodes_clone = Arc::clone(&start_nodes);
         let progress_clone = Arc::clone(&progress);
         let handle = thread::spawn(move || {
             let local_graph = build_de_bruijn_graph(&chunk, k);
+            let mut local_start_nodes = HashSet::new();
             let mut global_graph = graph_clone.write().unwrap(); // Acquire write lock
             for (prefix, suffixes) in local_graph {
                 global_graph
-                    .entry(prefix)
+                    .entry(prefix.to_owned())
                     .and_modify(|existing_suffixes: &mut Vec<_>| {
                         for suffix in &suffixes {
                             if !existing_suffixes.contains(suffix) {
@@ -211,7 +214,20 @@ fn process_reads_to_contigs(sequences: Vec<String>, k: usize, num_threads: usize
                         }
                     })
                     .or_insert_with(|| suffixes.clone());
+                if !global_graph
+                    .values()
+                    .any(|suffixes| suffixes.contains(&prefix))
+                {
+                    local_start_nodes.insert(prefix);
+                }
+                for suffix in &suffixes {
+                    if !global_graph.contains_key(suffix) {
+                        local_start_nodes.insert(suffix.clone());
+                    }
+                }
             }
+            let mut start_nodes_write = start_nodes_clone.write().unwrap();
+            start_nodes_write.extend(local_start_nodes);
             let completed = progress_clone.fetch_add(1, Ordering::Relaxed) + 1;
             println!(
                 "Graph construction progress: {}/{}",
@@ -223,23 +239,14 @@ fn process_reads_to_contigs(sequences: Vec<String>, k: usize, num_threads: usize
     for handle in handles {
         handle.join().unwrap();
     }
-    let graph_read = graph.read().unwrap(); // Acquire read lock
-    let contigs = Arc::new(RwLock::new(Vec::new()));
-    let start_nodes: Vec<String> = graph_read
-        .keys()
-        .filter(|node| {
-            // For each node, check if it has no incoming edges (i.e., it's not a suffix of any other node)
-            !graph_read
-                .values()
-                .any(|suffixes| suffixes.iter().any(|suffix| suffix == *node))
-        })
-        .cloned()
-        .collect();
+    let start_nodes_read = start_nodes.read().unwrap();
+    let start_nodes: Vec<String> = start_nodes_read.clone().into_iter().collect();
     let chunk_size = if start_nodes.len() > 0 {
-        (start_nodes.len() + num_threads - 1) / num_threads
+        (start_nodes.len() + num_threads - 1) / (num_threads * 10)
     } else {
         1 // Default to 1 if there are no start nodes
     };
+    let contigs = Arc::new(RwLock::new(Vec::new()));
     let start_chunks: Vec<_> = start_nodes
         .chunks(chunk_size)
         .map(|chunk| chunk.to_vec())
