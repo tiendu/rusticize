@@ -1,11 +1,12 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::env;
 use std::fs::File;
+use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc, RwLock,
+    Arc, Mutex, RwLock,
 };
 use std::thread;
 
@@ -52,6 +53,12 @@ struct Seq {
     quality: Option<String>,
 }
 
+fn hash_string(s: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    s.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn read_sequences(file_path: &str, file_type: FileType) -> io::Result<Vec<Seq>> {
     let file = File::open(file_path)?;
     let reader: Box<dyn BufRead> = if file_path.ends_with(".gz") {
@@ -59,7 +66,7 @@ fn read_sequences(file_path: &str, file_type: FileType) -> io::Result<Vec<Seq>> 
     } else {
         Box::new(BufReader::new(file))
     };
-    let mut seqs: Vec<Seq> = Vec::new();
+    let mut unique_seqs: HashMap<u64, Seq> = HashMap::new();
     match file_type {
         FileType::FASTQ => {
             let mut lines = reader.lines();
@@ -69,7 +76,8 @@ fn read_sequences(file_path: &str, file_type: FileType) -> io::Result<Vec<Seq>> 
                 let header = header?;
                 let seq = seq?;
                 let qual = qual?;
-                seqs.push(Seq {
+                let seq_hash = hash_string(&seq);
+                unique_seqs.entry(seq_hash).or_insert(Seq {
                     id: header[1..].to_string(),
                     sequence: seq,
                     quality: Some(qual),
@@ -91,7 +99,8 @@ fn read_sequences(file_path: &str, file_type: FileType) -> io::Result<Vec<Seq>> 
                     }
                     seq.push_str(lines.next().unwrap()?.trim());
                 }
-                seqs.push(Seq {
+                let seq_hash = hash_string(&seq);
+                unique_seqs.entry(seq_hash).or_insert(Seq {
                     id: seqid,
                     sequence: seq,
                     quality: None,
@@ -99,7 +108,7 @@ fn read_sequences(file_path: &str, file_type: FileType) -> io::Result<Vec<Seq>> 
             }
         }
     }
-    Ok(seqs)
+    Ok(unique_seqs.into_values().collect())
 }
 
 fn write_sequences_to_file(sequences: &[String], file_path: &str) -> io::Result<()> {
@@ -115,165 +124,143 @@ fn write_sequences_to_file(sequences: &[String], file_path: &str) -> io::Result<
     Ok(())
 }
 
-fn build_de_bruijn_graph(reads: &[String], k: usize) -> HashMap<String, Vec<String>> {
-    let mut graph: HashMap<String, Vec<String>> = HashMap::new();
-    for read in reads {
-        for i in 0..=read.len() - k {
-            let kmer = &read[i..i + k];
-            let prefix = &kmer[..k - 1];
-            let suffix = &kmer[1..];
-            graph
-                .entry(prefix.to_string())
-                .and_modify(|suffixes| {
-                    if !suffixes.contains(&suffix.to_string()) {
-                        suffixes.push(suffix.to_string());
-                    }
-                })
-                .or_insert_with(|| vec![suffix.to_string()]);
+fn build_local_graph(sequences: &[String], k: usize) -> Vec<String> {
+    let mut graph = Vec::new();
+    for sequence in sequences {
+        for i in 0..=sequence.len() - k {
+            let kmer = &sequence[i..i + k];
+            let annotated_kmer = if i == 0 && i + k == sequence.len() {
+                format!("^{}$", kmer) // Start and end
+            } else if i == 0 {
+                format!("^{}", kmer) // Start node
+            } else if i + k == sequence.len() {
+                format!("{}$", kmer) // End node
+            } else {
+                kmer.to_string() // Intermediate node
+            };
+            if !graph.contains(&annotated_kmer) {
+                graph.push(annotated_kmer);
+            }
         }
     }
     graph
 }
 
-fn generate_contigs_from_graph(
-    graph: &RwLock<HashMap<String, Vec<String>>>,
-    k: usize,
-    start_nodes: Vec<String>,
-) -> Vec<String> {
-    let mut contigs = Vec::new();
-    let mut visited_edges: HashSet<(String, String)> = HashSet::new();
-    // Helper to build a contig from a path
-    let build_contig = |path: &[String]| -> String {
-        path.iter()
-            .skip(1) // Skip the first node since it is already included as the base
-            .fold(path[0].clone(), |mut contig, node| {
-                // For each subsequent node in the path, append its unique suffix (k-1 overlapping portion)
-                contig.push_str(&node[k - 1..]);
-                contig
-            })
-    };
-    // Traverse the graph starting from each node in the chunk
-    for start_node in start_nodes {
-        let mut stack = vec![start_node.clone()];
-        let mut path = Vec::new();
-        while let Some(current_node) = stack.pop() {
-            path.push(current_node.clone());
-            let graph_read = graph.read().unwrap(); // Acquire read lock
-            if let Some(suffixes) = graph_read.get(&current_node) {
-                let mut sorted_suffixes = suffixes.clone();
-                sorted_suffixes.sort();
-                let mut extended = false;
-                for suffix in sorted_suffixes {
-                    let edge = (current_node.clone(), suffix.clone());
-                    if !visited_edges.contains(&edge) {
-                        visited_edges.insert(edge);
-                        stack.push(suffix.clone());
-                        extended = true;
-                    }
-                }
-                if !extended {
-                    contigs.push(build_contig(&path));
-                    path.pop(); // Backtrack
-                }
-            } else {
-                contigs.push(build_contig(&path));
-                path.pop(); // Backtrack
-            }
-        }
-    }
-    contigs
-}
-
-fn process_reads_to_contigs(sequences: Vec<String>, k: usize, num_threads: usize) -> Vec<String> {
-    let chunk_size = (sequences.len() + num_threads - 1) / (num_threads * 10);
+fn build_global_graph(sequences: Vec<String>, k: usize, num_threads: usize) -> HashSet<String> {
+    let chunk_size = (sequences.len() + num_threads - 1) / num_threads;
     let sequence_chunks: Vec<_> = sequences
         .chunks(chunk_size)
         .map(|chunk| chunk.to_vec())
         .collect();
-    let graph = Arc::new(RwLock::new(HashMap::new()));
-    let start_nodes = Arc::new(RwLock::new(HashSet::new()));
-    let total_chunks = sequence_chunks.len();
-    let progress = Arc::new(AtomicUsize::new(0));
+    let global_graph = Arc::new(RwLock::new(HashSet::<String>::new()));
     let mut handles = Vec::new();
     for chunk in sequence_chunks {
-        let graph_clone = Arc::clone(&graph);
-        let start_nodes_clone = Arc::clone(&start_nodes);
-        let progress_clone = Arc::clone(&progress);
+        let global_graph_clone = Arc::clone(&global_graph);
         let handle = thread::spawn(move || {
-            let local_graph = build_de_bruijn_graph(&chunk, k);
-            let mut local_start_nodes = HashSet::new();
-            let mut global_graph = graph_clone.write().unwrap(); // Acquire write lock
-            for (prefix, suffixes) in local_graph {
-                global_graph
-                    .entry(prefix.to_owned())
-                    .and_modify(|existing_suffixes: &mut Vec<_>| {
-                        for suffix in &suffixes {
-                            if !existing_suffixes.contains(suffix) {
-                                existing_suffixes.push(suffix.to_owned());
-                            }
-                        }
-                    })
-                    .or_insert_with(|| suffixes.clone());
-                if !global_graph
-                    .values()
-                    .any(|suffixes| suffixes.contains(&prefix))
+            let local_graph = build_local_graph(&chunk, k); // Generate local kmers
+            let mut global_graph_lock = global_graph_clone.write().unwrap();
+            for local_kmer in local_graph {
+                let raw_local_kmer = local_kmer.trim_matches(&['^', '$']);
+                if let Some(existing_kmer) = global_graph_lock
+                    .iter()
+                    .cloned()
+                    .find(|global_kmer| global_kmer.trim_matches(&['^', '$']) == raw_local_kmer)
                 {
-                    local_start_nodes.insert(prefix);
-                }
-                for suffix in &suffixes {
-                    if !global_graph.contains_key(suffix) {
-                        local_start_nodes.insert(suffix.clone());
+                    if existing_kmer.contains('^') || existing_kmer.contains('$') {
+                        global_graph_lock.remove(&existing_kmer);
+                        global_graph_lock.insert(local_kmer);
                     }
+                } else {
+                    global_graph_lock.insert(local_kmer);
                 }
             }
-            let mut start_nodes_write = start_nodes_clone.write().unwrap();
-            start_nodes_write.extend(local_start_nodes);
-            let completed = progress_clone.fetch_add(1, Ordering::Relaxed) + 1;
-            println!(
-                "Graph construction progress: {}/{}",
-                completed, total_chunks
-            );
         });
         handles.push(handle);
     }
+    // Wait for all threads to finish
     for handle in handles {
         handle.join().unwrap();
     }
-    let start_nodes_read = start_nodes.read().unwrap();
-    let start_nodes: Vec<String> = start_nodes_read.clone().into_iter().collect();
-    let chunk_size = if start_nodes.len() > 0 {
-        (start_nodes.len() + num_threads - 1) / (num_threads * 10)
-    } else {
-        1 // Default to 1 if there are no start nodes
-    };
-    let contigs = Arc::new(RwLock::new(Vec::new()));
-    let start_chunks: Vec<_> = start_nodes
+    // Return the final global graph
+    let global_graph_lock = global_graph.read().unwrap();
+    global_graph_lock.clone()
+}
+
+fn depth_first_search(
+    current_node: String,
+    current_contig: &mut String,
+    graph_nodes: &HashSet<String>,
+    visited: &mut HashSet<String>,
+    contigs: &mut Vec<String>,
+) {
+    visited.insert(current_node.clone());
+    if current_node.ends_with('$') {
+        contigs.push(format!("^{}$", current_contig.clone()));
+        return; // End node reached, backtrack
+    }
+    let suffix = &current_node.trim_start_matches('^')[1..];
+    for next_node in graph_nodes.iter().filter(|node| node.starts_with(suffix)) {
+        if !visited.contains(next_node) {
+            let core = next_node.trim_matches(&['^', '$']);
+            current_contig.push(core.chars().last().unwrap());
+            depth_first_search(
+                next_node.clone(),
+                current_contig,
+                graph_nodes,
+                visited,
+                contigs,
+            );
+            // Backtrack
+            current_contig.pop();
+        }
+    }
+    visited.remove(&current_node);
+}
+
+fn construct_contigs(graph_nodes: &HashSet<String>, num_threads: usize) -> Vec<String> {
+    let graph_nodes = Arc::new(graph_nodes.clone());
+    let contigs = Arc::new(Mutex::new(Vec::new()));
+    let start_nodes: Vec<_> = graph_nodes
+        .iter()
+        .filter(|n| n.starts_with('^'))
+        .cloned()
+        .collect();
+    let chunk_size = (start_nodes.len() + num_threads - 1) / num_threads;
+    let chunks: Vec<_> = start_nodes
         .chunks(chunk_size)
         .map(|chunk| chunk.to_vec())
         .collect();
-    let total_start_chunks = start_chunks.len();
-    let progress = Arc::new(AtomicUsize::new(0));
     let mut handles = Vec::new();
-    for chunk in start_chunks {
-        let graph_clone = Arc::clone(&graph);
-        let contigs_clone = Arc::clone(&contigs);
-        let progress_clone = Arc::clone(&progress);
+    for chunk in chunks {
+        let graph_nodes = Arc::clone(&graph_nodes);
+        let contigs = Arc::clone(&contigs);
         let handle = thread::spawn(move || {
-            let local_contigs = generate_contigs_from_graph(&graph_clone, k - 1, chunk);
-            contigs_clone.write().unwrap().extend(local_contigs); // Acquire write lock
-            let completed = progress_clone.fetch_add(1, Ordering::Relaxed) + 1;
-            println!(
-                "Contig generation progress: {}/{}",
-                completed, total_start_chunks
-            );
+            for start_node in chunk {
+                let mut visited = HashSet::new();
+                let mut current_contig = start_node.trim_start_matches('^').to_string();
+                let mut local_contigs = Vec::new();
+                depth_first_search(
+                    start_node.clone(),
+                    &mut current_contig,
+                    &graph_nodes,
+                    &mut visited,
+                    &mut local_contigs,
+                );
+                let mut contigs_lock = contigs.lock().unwrap();
+                contigs_lock.extend(local_contigs);
+            }
         });
         handles.push(handle);
     }
     for handle in handles {
         handle.join().unwrap();
     }
-    let contigs_read = contigs.read().unwrap(); // Acquire read lock
-    (*contigs_read).clone()
+    let contigs = Arc::try_unwrap(contigs).unwrap().into_inner().unwrap();
+    contigs
+        .into_iter()
+        .filter(|c| c.starts_with('^') && c.ends_with('$'))
+        .map(|c| c.trim_matches(&['^', '$']).to_string())
+        .collect()
 }
 
 fn main() -> io::Result<()> {
@@ -300,7 +287,7 @@ fn main() -> io::Result<()> {
     let k: usize = args
         .get(3)
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(55);
+        .unwrap_or(53);
     let available_threads = thread::available_parallelism().map_or(1, |n| n.get());
     let num_threads = std::cmp::min(
         available_threads,
@@ -309,9 +296,9 @@ fn main() -> io::Result<()> {
             .unwrap_or(4),
     );
     let sequences = read_sequences(input_file, FileType::from_filename(&input_file)?)?;
-    let unique_sequences: HashSet<String> = sequences.into_iter().map(|s| s.sequence).collect();
-    let contigs =
-        process_reads_to_contigs(Vec::from_iter(unique_sequences.into_iter()), k, num_threads);
+    let raw_sequences: Vec<String> = sequences.into_iter().map(|s| s.sequence).collect();
+    let graph = build_global_graph(raw_sequences, k, num_threads);
+    let contigs = construct_contigs(&graph, num_threads);
     write_sequences_to_file(&contigs, output_file)?;
     Ok(())
 }
