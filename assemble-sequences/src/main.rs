@@ -176,7 +176,11 @@ fn build_global_graph(sequences: Vec<String>, k: usize, num_threads: usize) -> H
                 {
                     if existing_kmer.contains('^') || existing_kmer.contains('$') {
                         global_graph_lock.remove(&existing_kmer);
-                        global_graph_lock.insert(local_kmer);
+                        if local_kmer.contains('^') || local_kmer.contains('$') {
+                            global_graph_lock.insert(raw_local_kmer.to_string());
+                        } else {
+                            global_graph_lock.insert(local_kmer);
+                        }
                     }
                 } else {
                     global_graph_lock.insert(local_kmer);
