@@ -1,3 +1,4 @@
+// Standard Library Imports
 use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::env;
 use std::fs::File;
@@ -10,10 +11,12 @@ use std::sync::{
 };
 use std::thread;
 
+// External Crate Imports
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 
+// File Type
 #[derive(Debug, Clone, Copy)]
 enum FileType {
     FASTA,
@@ -59,7 +62,7 @@ fn hash_string(s: &str) -> u64 {
     hasher.finish()
 }
 
-fn read_sequences(file_path: &str, file_type: FileType) -> io::Result<Vec<Seq>> {
+fn read_sequences_to_raw(file_path: &str, file_type: FileType) -> io::Result<Vec<String>> {
     let file = File::open(file_path)?;
     let reader: Box<dyn BufRead> = if file_path.ends_with(".gz") {
         Box::new(BufReader::new(GzDecoder::new(file)))
@@ -108,10 +111,13 @@ fn read_sequences(file_path: &str, file_type: FileType) -> io::Result<Vec<Seq>> 
             }
         }
     }
-    Ok(unique_seqs.into_values().collect())
+    Ok(unique_seqs
+        .into_iter()
+        .map(|(_, seq)| seq.sequence)
+        .collect())
 }
 
-fn write_sequences_to_file(sequences: &[String], file_path: &str) -> io::Result<()> {
+fn write_contigs_to_file(sequences: &[String], file_path: &str) -> io::Result<()> {
     let file = File::create(file_path)?;
     let mut writer: Box<dyn Write> = if file_path.ends_with(".gz") {
         Box::new(GzEncoder::new(file, Compression::default()))
@@ -119,7 +125,7 @@ fn write_sequences_to_file(sequences: &[String], file_path: &str) -> io::Result<
         Box::new(file)
     };
     for (i, seq) in sequences.iter().enumerate() {
-        writeln!(writer, ">{}\n{}", format!("Contig_{}", i), seq)?;
+        writeln!(writer, ">{}\n{}", format!("{}|{}", i, seq.len()), seq)?;
     }
     Ok(())
 }
@@ -153,9 +159,11 @@ fn build_global_graph(sequences: Vec<String>, k: usize, num_threads: usize) -> H
         .map(|chunk| chunk.to_vec())
         .collect();
     let global_graph = Arc::new(RwLock::new(HashSet::<String>::new()));
+    let progress = Arc::new(AtomicUsize::new(0));
     let mut handles = Vec::new();
     for chunk in sequence_chunks {
         let global_graph_clone = Arc::clone(&global_graph);
+        let progress = Arc::clone(&progress);
         let handle = thread::spawn(move || {
             let local_graph = build_local_graph(&chunk, k); // Generate local kmers
             let mut global_graph_lock = global_graph_clone.write().unwrap();
@@ -174,6 +182,12 @@ fn build_global_graph(sequences: Vec<String>, k: usize, num_threads: usize) -> H
                     global_graph_lock.insert(local_kmer);
                 }
             }
+            let current_progress = (progress.fetch_add(1, Ordering::Relaxed) + 1) * chunk_size;
+            let approximate_progress = ((current_progress + 5) / 10) * 10; // Round to nearest 10
+            println!(
+                "Approximate progress: ~{} graphs generated",
+                approximate_progress
+            );
         });
         handles.push(handle);
     }
@@ -230,14 +244,16 @@ fn construct_contigs(graph_nodes: &HashSet<String>, num_threads: usize) -> Vec<S
         .chunks(chunk_size)
         .map(|chunk| chunk.to_vec())
         .collect();
+    let progress = Arc::new(AtomicUsize::new(0));
     let mut handles = Vec::new();
     for chunk in chunks {
         let graph_nodes = Arc::clone(&graph_nodes);
         let contigs = Arc::clone(&contigs);
+        let progress = Arc::clone(&progress);
         let handle = thread::spawn(move || {
             for start_node in chunk {
                 let mut visited = HashSet::new();
-                let mut current_contig = start_node.trim_start_matches('^').to_string();
+                let mut current_contig = start_node.to_string();
                 let mut local_contigs = Vec::new();
                 depth_first_search(
                     start_node.clone(),
@@ -249,13 +265,19 @@ fn construct_contigs(graph_nodes: &HashSet<String>, num_threads: usize) -> Vec<S
                 let mut contigs_lock = contigs.lock().unwrap();
                 contigs_lock.extend(local_contigs);
             }
+            let current_progress = (progress.fetch_add(1, Ordering::Relaxed) + 1) * chunk_size;
+            let approximate_progress = ((current_progress + 5) / 10) * 10; // Round to nearest 10
+            println!(
+                "Approximate progress: ~{} nodes processed",
+                approximate_progress
+            );
         });
         handles.push(handle);
     }
     for handle in handles {
         handle.join().unwrap();
     }
-    let contigs = Arc::try_unwrap(contigs).unwrap().into_inner().unwrap();
+    let mut contigs = Arc::try_unwrap(contigs).unwrap().into_inner().unwrap();
     contigs
         .into_iter()
         .filter(|c| c.starts_with('^') && c.ends_with('$'))
@@ -287,7 +309,7 @@ fn main() -> io::Result<()> {
     let k: usize = args
         .get(3)
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(53);
+        .unwrap_or(55);
     let available_threads = thread::available_parallelism().map_or(1, |n| n.get());
     let num_threads = std::cmp::min(
         available_threads,
@@ -295,10 +317,9 @@ fn main() -> io::Result<()> {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(4),
     );
-    let sequences = read_sequences(input_file, FileType::from_filename(&input_file)?)?;
-    let raw_sequences: Vec<String> = sequences.into_iter().map(|s| s.sequence).collect();
+    let raw_sequences = read_sequences_to_raw(input_file, FileType::from_filename(&input_file)?)?;
     let graph = build_global_graph(raw_sequences, k, num_threads);
     let contigs = construct_contigs(&graph, num_threads);
-    write_sequences_to_file(&contigs, output_file)?;
+    write_contigs_to_file(&contigs, output_file)?;
     Ok(())
 }
