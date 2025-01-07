@@ -185,7 +185,7 @@ fn deduplicate_sequences(
                         .unwrap_or(total_sequences),
                 };
                 let current_seq = &sequences[i];
-                if similarity == 100.0 {
+                if similarity == 1.0 {
                     if !sequences[next_index + 1..]
                         .iter()
                         .any(|s| s.sequence.contains(&current_seq.sequence))
@@ -196,7 +196,7 @@ fn deduplicate_sequences(
                     if !sequences[i + 1..].iter().any(|s| {
                         let current_len = current_seq.sequence.len();
                         let candidate_len = s.sequence.len();
-                        let max_mismatches = ((1.0 - similarity / 100.0)
+                        let max_mismatches = ((1.0 - similarity)
                             * usize::min(current_len, candidate_len) as f64)
                             .ceil() as usize;
                         (0..=candidate_len.saturating_sub(current_len)).any(|start| {
@@ -246,9 +246,13 @@ fn main() -> io::Result<()> {
     }
     let input_file = &args[1];
     let output_file = &args[2];
-    let similarity_threshold: f64 = args[3]
-        .parse::<f64>()
-        .expect("Please provide a valid similarity value as a floating-point number.");
+    let similarity_threshold: f64 = args.get(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            let threshold = 1.0;
+            eprintln!("Valid similarity value [0.0 - 1.0] not provided. Using default value: {}", threshold);
+            threshold
+        });
     let max_cpus = thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1); // Fallback to 1 if unavailable
@@ -256,7 +260,7 @@ fn main() -> io::Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| {
             let threads = 4;
-            eprintln!("Invalid number of threads or not provided. Using default value: {}", threads);
+            eprintln!("Valid number of threads [1 - {}] not provided or invalid. Using default value: {}", max_cpus, threads);
             std::cmp::min(threads, max_cpus)
         });
     if !Path::new(input_file).exists() {
