@@ -7,7 +7,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc, Mutex, RwLock,
+    Arc, RwLock,
 };
 use std::thread;
 
@@ -204,86 +204,91 @@ fn build_global_graph(sequences: Vec<String>, k: usize, num_threads: usize) -> H
     global_graph_lock.clone()
 }
 
-fn depth_first_search(
-    current_node: String,
-    current_contig: &mut String,
-    graph_nodes: &HashSet<String>,
-    visited: &mut HashSet<String>,
-    contigs: &mut Vec<String>,
-) {
-    visited.insert(current_node.clone());
-    if current_node.ends_with('$') {
-        contigs.push(format!("^{}$", current_contig.clone()));
-        return; // End node reached, backtrack
-    }
-    let suffix = &current_node.trim_start_matches('^')[1..];
-    for next_node in graph_nodes.iter().filter(|node| node.starts_with(suffix)) {
-        if !visited.contains(next_node) {
-            let core = next_node.trim_matches(&['^', '$']);
-            current_contig.push(core.chars().last().unwrap());
-            depth_first_search(
-                next_node.clone(),
-                current_contig,
-                graph_nodes,
-                visited,
-                contigs,
-            );
-            // Backtrack
-            current_contig.pop();
+fn construct_contigs(kmers: &HashSet<String>, num_threads: usize) -> Vec<String> {
+    // Separate start, intermediate, and end nodes
+    let mut start_nodes: Vec<String> = Vec::new();
+    let mut end_nodes: Vec<String> = Vec::new();
+    let mut intermediate_nodes: Vec<String> = Vec::new();
+    for kmer in kmers {
+        if kmer.starts_with('^') {
+            start_nodes.push(kmer.clone());
+        } else if kmer.ends_with('$') {
+            end_nodes.push(kmer.clone());
+        } else {
+            intermediate_nodes.push(kmer.clone());
         }
     }
-    visited.remove(&current_node);
-}
-
-fn construct_contigs(graph_nodes: &HashSet<String>, num_threads: usize) -> Vec<String> {
-    let graph_nodes = Arc::new(graph_nodes.clone());
-    let contigs = Arc::new(Mutex::new(Vec::new()));
-    let start_nodes: Vec<_> = graph_nodes
-        .iter()
-        .filter(|n| n.starts_with('^'))
-        .cloned()
-        .collect();
-    let chunk_size = (start_nodes.len() + num_threads - 1) / num_threads;
-    let chunks: Vec<_> = start_nodes
-        .chunks(chunk_size)
+    // Shared data structures for threads
+    let all_contigs = Arc::new(RwLock::new(Vec::new()));
+    let start_node_chunks: Vec<_> = start_nodes
+        .chunks((start_nodes.len() + num_threads - 1) / num_threads)
         .map(|chunk| chunk.to_vec())
         .collect();
-    let progress = Arc::new(AtomicUsize::new(0));
+    let end_nodes = Arc::new(end_nodes);
     let mut handles = Vec::new();
-    for chunk in chunks {
-        let graph_nodes = Arc::clone(&graph_nodes);
-        let contigs = Arc::clone(&contigs);
-        let progress = Arc::clone(&progress);
+    for chunk in start_node_chunks {
+        let all_contigs = Arc::clone(&all_contigs);
+        let end_nodes = Arc::clone(&end_nodes);
+        let local_intermediate_nodes = intermediate_nodes.clone();
         let handle = thread::spawn(move || {
+            let mut local_contigs = Vec::new();
             for start_node in chunk {
-                let mut visited = HashSet::new();
-                let mut current_contig = start_node.to_string();
-                let mut local_contigs = Vec::new();
-                depth_first_search(
-                    start_node.clone(),
-                    &mut current_contig,
-                    &graph_nodes,
-                    &mut visited,
-                    &mut local_contigs,
-                );
-                let mut contigs_lock = contigs.lock().unwrap();
-                contigs_lock.extend(local_contigs);
+                let mut current_paths = vec![start_node]; // Initialize with the current start node
+                let mut remaining_nodes = local_intermediate_nodes.clone(); // Local Vec for thread
+                while !current_paths.is_empty() {
+                    let mut new_paths = Vec::new(); // For branching paths
+                    for path in current_paths {
+                        // Get the last kmer in the current path (strip '^')
+                        let last_kmer = path.trim_start_matches('^');
+                        // Find matching nodes based on overlap
+                        let mut matches = Vec::new();
+                        for node in remaining_nodes.iter().chain(end_nodes.iter()) {
+                            let overlap_length = if end_nodes.contains(node) {
+                                node.len() - 2 // End nodes have a shorter overlap
+                            } else {
+                                node.len() - 1
+                            };
+                            if last_kmer.ends_with(&node[..overlap_length]) {
+                                matches.push(node.clone());
+                            }
+                        }
+                        // Process matches
+                        for matched_node in matches {
+                            if end_nodes.contains(&matched_node) {
+                                // Finalize the path if it's an end node
+                                let mut new_contig = path.clone();
+                                new_contig.push_str(&matched_node[matched_node.len() - 2..]);
+                                local_contigs.push(new_contig);
+                            } else {
+                                // Extend the path with intermediate nodes
+                                let mut extended_path = path.clone();
+                                extended_path.push_str(&matched_node[matched_node.len() - 1..]);
+                                new_paths.push(extended_path);
+                                // Remove the used intermediate node
+                                remaining_nodes.retain(|n| n != &matched_node);
+                            }
+                        }
+                    }
+                    // Update the current paths with the new paths
+                    current_paths = new_paths;
+                }
             }
-            let current_progress = (progress.fetch_add(1, Ordering::Relaxed) + 1) * chunk_size;
-            let approximate_progress = ((current_progress + 5) / 10) * 10; // Round to nearest 10
-            println!(
-                "Approximate progress: ~{} nodes processed",
-                approximate_progress
-            );
+            // Write local results to the shared contigs
+            let mut global_contigs = all_contigs.write().unwrap();
+            global_contigs.extend(local_contigs);
         });
+
         handles.push(handle);
     }
+    // Wait for threads to finish
     for handle in handles {
         handle.join().unwrap();
     }
-    let mut contigs = Arc::try_unwrap(contigs).unwrap().into_inner().unwrap();
-    contigs
-        .into_iter()
+    // Filter valid contigs (must start with "^" and end with "$")
+    let global_contigs = all_contigs.read().unwrap();
+    global_contigs
+        .iter()
+        .cloned()
         .filter(|c| c.starts_with('^') && c.ends_with('$'))
         .map(|c| c.trim_matches(&['^', '$']).to_string())
         .collect()
