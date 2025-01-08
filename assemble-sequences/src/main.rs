@@ -160,6 +160,7 @@ fn build_global_graph(sequences: Vec<String>, k: usize, num_threads: usize) -> H
         .collect();
     let global_graph = Arc::new(RwLock::new(HashSet::<String>::new()));
     let progress = Arc::new(AtomicUsize::new(0));
+    let total_sequences = sequences.len();
     let mut handles = Vec::new();
     for chunk in sequence_chunks {
         let global_graph_clone = Arc::clone(&global_graph);
@@ -186,11 +187,13 @@ fn build_global_graph(sequences: Vec<String>, k: usize, num_threads: usize) -> H
                     global_graph_lock.insert(local_kmer);
                 }
             }
-            let current_progress = (progress.fetch_add(1, Ordering::Relaxed) + 1) * chunk_size;
-            let approximate_progress = ((current_progress + 5) / 10) * 10; // Round to nearest 10
+            let processed_sequences = chunk.len();
+            let current_progress =
+                progress.fetch_add(processed_sequences, Ordering::Relaxed) + processed_sequences;
+            let approximate_progress = (current_progress * 100) / total_sequences;
             println!(
-                "Approximate progress: ~{} graphs generated",
-                approximate_progress
+                "Progress: {}% ({}/{}) sequences processed",
+                approximate_progress, current_progress, total_sequences
             );
         });
         handles.push(handle);
@@ -218,22 +221,28 @@ fn construct_contigs(kmers: &HashSet<String>, num_threads: usize) -> Vec<String>
             intermediate_nodes.push(kmer.clone());
         }
     }
+
     // Shared data structures for threads
     let all_contigs = Arc::new(RwLock::new(Vec::new()));
+    let progress = Arc::new(AtomicUsize::new(0)); // Progress tracker
+    let total_start_nodes = start_nodes.len();
     let start_node_chunks: Vec<_> = start_nodes
-        .chunks((start_nodes.len() + num_threads - 1) / num_threads)
+        .chunks((total_start_nodes + num_threads - 1) / num_threads)
         .map(|chunk| chunk.to_vec())
         .collect();
     let end_nodes = Arc::new(end_nodes);
     let mut handles = Vec::new();
+
     for chunk in start_node_chunks {
         let all_contigs = Arc::clone(&all_contigs);
         let end_nodes = Arc::clone(&end_nodes);
         let local_intermediate_nodes = intermediate_nodes.clone();
+        let progress = Arc::clone(&progress);
+
         let handle = thread::spawn(move || {
             let mut local_contigs = Vec::new();
-            for start_node in chunk {
-                let mut current_paths = vec![start_node]; // Initialize with the current start node
+            for (i, start_node) in chunk.iter().enumerate() {
+                let mut current_paths = vec![start_node.clone()]; // Initialize with the current start node
                 let mut remaining_nodes = local_intermediate_nodes.clone(); // Local Vec for thread
                 while !current_paths.is_empty() {
                     let mut new_paths = Vec::new(); // For branching paths
@@ -272,7 +281,18 @@ fn construct_contigs(kmers: &HashSet<String>, num_threads: usize) -> Vec<String>
                     // Update the current paths with the new paths
                     current_paths = new_paths;
                 }
+
+                // Update progress
+                let current_progress = progress.fetch_add(1, Ordering::Relaxed) + 1;
+                let approximate_progress = ((current_progress * 100) / total_start_nodes).min(100); // Prevent over 100%
+                if current_progress % 10 == 0 || current_progress == total_start_nodes {
+                    println!(
+                        "Progress: {}% ({}/{}) contigs processed",
+                        approximate_progress, current_progress, total_start_nodes
+                    );
+                }
             }
+
             // Write local results to the shared contigs
             let mut global_contigs = all_contigs.write().unwrap();
             global_contigs.extend(local_contigs);
@@ -280,10 +300,12 @@ fn construct_contigs(kmers: &HashSet<String>, num_threads: usize) -> Vec<String>
 
         handles.push(handle);
     }
+
     // Wait for threads to finish
     for handle in handles {
         handle.join().unwrap();
     }
+
     // Filter valid contigs (must start with "^" and end with "$")
     let global_contigs = all_contigs.read().unwrap();
     global_contigs
