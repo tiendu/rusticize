@@ -135,9 +135,7 @@ fn build_local_graph(sequences: &[String], k: usize) -> Vec<String> {
     for sequence in sequences {
         for i in 0..=sequence.len() - k {
             let kmer = &sequence[i..i + k];
-            let annotated_kmer = if i == 0 && i + k == sequence.len() {
-                format!("^{}$", kmer) // Start and end
-            } else if i == 0 {
+            let annotated_kmer = if i == 0 {
                 format!("^{}", kmer) // Start node
             } else if i + k == sequence.len() {
                 format!("{}$", kmer) // End node
