@@ -130,11 +130,11 @@ fn write_contigs_to_file(sequences: &[String], file_path: &str) -> io::Result<()
     Ok(())
 }
 
-fn build_local_graph(sequences: &[String], k: usize) -> HashMap<String, String> {
-    let mut local_graph = HashMap::<String, String>::new();
+fn build_local_graph(sequences: &[String], k: usize) -> HashSet<String> {
+    let mut local_graph = HashSet::<String>::new();
     for sequence in sequences {
-        if sequence.len() <= k {
-            continue;
+        if sequence.len() < k {
+            continue; // Skip sequences shorter than k
         }
         for i in 0..=sequence.len() - k {
             let kmer = &sequence[i..i + k];
@@ -145,16 +145,23 @@ fn build_local_graph(sequences: &[String], k: usize) -> HashMap<String, String> 
             } else {
                 kmer.to_string() // Intermediate node
             };
-            local_graph
-                .entry(kmer.to_string())
-                .and_modify(|existing_kmer| {
-                    if existing_kmer.contains('^') || existing_kmer.contains('$') {
-                        if annotated_kmer.contains('^') || annotated_kmer.contains('$') {
-                            *existing_kmer = kmer.to_string();
-                        }
+            // Resolve conflicts locally
+            if let Some(existing_kmer) = local_graph
+                .iter()
+                .cloned()
+                .find(|local_kmer| local_kmer.trim_matches(&['^', '$']) == kmer)
+            {
+                if existing_kmer.contains('^') || existing_kmer.contains('$') {
+                    local_graph.remove(&existing_kmer);
+                    if annotated_kmer.contains('^') || annotated_kmer.contains('$') {
+                        local_graph.insert(kmer.to_string());
+                    } else {
+                        local_graph.insert(annotated_kmer);
                     }
-                })
-                .or_insert(annotated_kmer);
+                }
+            } else {
+                local_graph.insert(annotated_kmer);
+            }
         }
     }
     local_graph
@@ -166,7 +173,7 @@ fn build_global_graph(sequences: Vec<String>, k: usize, num_threads: usize) -> H
         .chunks(chunk_size)
         .map(|chunk| chunk.to_vec())
         .collect();
-    let global_graph = Arc::new(RwLock::new(HashMap::<String, String>::new()));
+    let global_graph = Arc::new(RwLock::new(HashSet::<String>::new()));
     let progress = Arc::new(AtomicUsize::new(0));
     let total_sequences = sequences.len();
     let mut handles = Vec::new();
@@ -174,20 +181,29 @@ fn build_global_graph(sequences: Vec<String>, k: usize, num_threads: usize) -> H
         let global_graph_clone = Arc::clone(&global_graph);
         let progress = Arc::clone(&progress);
         let handle = thread::spawn(move || {
-            let local_graph = build_local_graph(&chunk, k);
+            let local_graph = build_local_graph(&chunk, k); // Generate local k-mers
             let mut global_graph_lock = global_graph_clone.write().unwrap();
-            for (kmer, annotated_kmer) in local_graph {
-                global_graph_lock
-                    .entry(kmer.clone()) // Clone here to avoid moving
-                    .and_modify(|existing_kmer| {
-                        if existing_kmer.contains('^') || existing_kmer.contains('$') {
-                            if annotated_kmer.contains('^') || annotated_kmer.contains('$') {
-                                *existing_kmer = kmer.clone();
-                            }
+            for local_kmer in local_graph {
+                let raw_local_kmer = local_kmer.trim_matches(&['^', '$']).to_string();
+                if let Some(existing_kmer) = global_graph_lock
+                    .iter()
+                    .cloned()
+                    .find(|global_kmer| global_kmer.trim_matches(&['^', '$']) == raw_local_kmer)
+                {
+                    // Resolve conflict if annotations differ
+                    if existing_kmer.contains('^') || existing_kmer.contains('$') {
+                        global_graph_lock.remove(&existing_kmer);
+                        if local_kmer.contains('^') || local_kmer.contains('$') {
+                            global_graph_lock.insert(raw_local_kmer);
+                        } else {
+                            global_graph_lock.insert(local_kmer);
                         }
-                    })
-                    .or_insert(annotated_kmer);
+                    }
+                } else {
+                    global_graph_lock.insert(local_kmer);
+                }
             }
+            // Update progress
             let processed_sequences = chunk.len();
             let current_progress =
                 progress.fetch_add(processed_sequences, Ordering::Relaxed) + processed_sequences;
@@ -202,11 +218,9 @@ fn build_global_graph(sequences: Vec<String>, k: usize, num_threads: usize) -> H
     for handle in handles {
         handle.join().unwrap();
     }
+    // Return the final global graph
     let global_graph_lock = global_graph.read().unwrap();
-    global_graph_lock
-        .values()
-        .cloned()
-        .collect::<HashSet<String>>()
+    global_graph_lock.clone()
 }
 
 fn construct_contigs(kmers: &HashSet<String>, num_threads: usize) -> Vec<String> {
@@ -240,7 +254,7 @@ fn construct_contigs(kmers: &HashSet<String>, num_threads: usize) -> Vec<String>
         let progress = Arc::clone(&progress);
         let handle = thread::spawn(move || {
             let mut local_contigs = Vec::new();
-            for (i, start_node) in chunk.iter().enumerate() {
+            for (_, start_node) in chunk.iter().enumerate() {
                 let mut current_paths = vec![start_node.clone()]; // Initialize with the current start node
                 let mut remaining_nodes = local_intermediate_nodes.clone(); // Local Vec for thread
                 while !current_paths.is_empty() {
