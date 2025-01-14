@@ -150,16 +150,12 @@ fn build_local_graph(sequences: &[String], k: usize) -> HashSet<String> {
             match local_graph.get(&hash) {
                 Some(existing_kmer) => {
                     if existing_kmer.contains('^') || existing_kmer.contains('$') {
-                        // Annotated version exists
-                        if annotated_kmer.contains('^') || annotated_kmer.contains('$') {
-                            local_graph.insert(hash, kmer.to_string()); // Prefer unannotated
-                        } else {
-                            local_graph.insert(hash, annotated_kmer); // Replace with new annotation
-                        }
+                        // Prefer unannotated k-mer if present
+                        local_graph.insert(hash, kmer.to_string());
                     }
                 }
                 None => {
-                    // No existing k-mer; insert new one
+                    // No existing k-mer; insert the annotated one
                     local_graph.insert(hash, annotated_kmer);
                 }
             }
@@ -202,12 +198,11 @@ fn build_global_graph(sequences: Vec<String>, k: usize, num_threads: usize) -> H
                         Some(existing_kmer) => {
                             // Resolve conflict if annotations differ
                             if existing_kmer.contains('^') || existing_kmer.contains('$') {
-                                if local_kmer.contains('^') || local_kmer.contains('$') {
-                                    global_graph_lock.insert(hash, raw_local_kmer.to_string());
-                                }
+                                global_graph_lock.insert(hash, raw_local_kmer.to_string());
                             }
                         }
                         None => {
+                            // Insert the k-mer directly to the global graph
                             global_graph_lock.insert(hash, local_kmer);
                         }
                     }
