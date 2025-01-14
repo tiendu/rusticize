@@ -170,7 +170,7 @@ fn build_local_graph(sequences: &[String], k: usize) -> HashSet<String> {
 }
 
 fn build_global_graph(sequences: Vec<String>, k: usize, num_threads: usize) -> HashSet<String> {
-    let chunk_size = (sequences.len() + num_threads - 1) / num_threads;
+    let chunk_size = 10_000;
     let sequence_chunks: Vec<_> = sequences
         .chunks(chunk_size)
         .map(|chunk| chunk.to_vec())
@@ -178,149 +178,195 @@ fn build_global_graph(sequences: Vec<String>, k: usize, num_threads: usize) -> H
     let global_graph = Arc::new(RwLock::new(HashMap::<u64, String>::new()));
     let progress = Arc::new(AtomicUsize::new(0));
     let total_sequences = sequences.len();
-    let mut handles = Vec::new();
     for chunk in sequence_chunks {
-        let global_graph_clone = Arc::clone(&global_graph);
-        let progress = Arc::clone(&progress);
-        let handle = thread::spawn(move || {
-            let local_graph = build_local_graph(&chunk, k); // Generate local k-mers
-            let mut global_graph_lock = global_graph_clone.write().unwrap();
-            for local_kmer in local_graph {
-                let raw_local_kmer = local_kmer.trim_matches(&['^', '$']);
-                let hash = hash_string(raw_local_kmer);
-                match global_graph_lock.get(&hash) {
-                    Some(existing_kmer) => {
-                        // Resolve conflict if annotations differ
-                        if existing_kmer.contains('^') || existing_kmer.contains('$') {
-                            if local_kmer.contains('^') || local_kmer.contains('$') {
-                                global_graph_lock.insert(hash, raw_local_kmer.to_string());
+        let chunk_len = chunk.len();
+        let sub_chunks: Vec<_> = if chunk_len < num_threads {
+            vec![chunk.to_vec()] // Keep the original chunk as is
+        } else {
+            chunk
+                .chunks((chunk_len + num_threads - 1) / num_threads)
+                .map(|sub_chunk| sub_chunk.to_vec())
+                .collect()
+        };
+        let mut handles = Vec::new();
+        for sub_chunk in sub_chunks {
+            let global_graph_clone = Arc::clone(&global_graph);
+            let progress = Arc::clone(&progress);
+            let handle = thread::spawn(move || {
+                let local_graph = build_local_graph(&sub_chunk, k); // Generate local k-mers
+                let mut global_graph_lock = global_graph_clone.write().unwrap();
+                for local_kmer in local_graph {
+                    let raw_local_kmer = local_kmer.trim_matches(&['^', '$']);
+                    let hash = hash_string(raw_local_kmer);
+                    match global_graph_lock.get(&hash) {
+                        Some(existing_kmer) => {
+                            // Resolve conflict if annotations differ
+                            if existing_kmer.contains('^') || existing_kmer.contains('$') {
+                                if local_kmer.contains('^') || local_kmer.contains('$') {
+                                    global_graph_lock.insert(hash, raw_local_kmer.to_string());
+                                }
                             }
                         }
-                    }
-                    None => {
-                        global_graph_lock.insert(hash, local_kmer);
+                        None => {
+                            global_graph_lock.insert(hash, local_kmer);
+                        }
                     }
                 }
-            }
-            // Update progress
-            let processed_sequences = chunk.len();
-            let current_progress =
-                progress.fetch_add(processed_sequences, Ordering::Relaxed) + processed_sequences;
-            let approximate_progress = (current_progress * 100) / total_sequences;
-            println!(
-                "Progress: {}% ({}/{}) sequences processed",
-                approximate_progress, current_progress, total_sequences
-            );
-        });
-        handles.push(handle);
-    }
-    for handle in handles {
-        handle.join().unwrap();
+                // Update progress
+                let processed_sequences = sub_chunk.len();
+                let current_progress = progress.fetch_add(processed_sequences, Ordering::Relaxed)
+                    + processed_sequences;
+                let approximate_progress = (current_progress * 100) / total_sequences;
+                println!(
+                    "Progress: {}% ({}/{}) sequences processed",
+                    approximate_progress,
+                    format_with_delimiters(current_progress),
+                    format_with_delimiters(total_sequences)
+                );
+            });
+            handles.push(handle);
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
     }
     // Extract the values from the map as a HashSet
     let global_graph_lock = global_graph.read().unwrap();
-    global_graph_lock.values().cloned().collect::<HashSet<String>>()
+    global_graph_lock
+        .values()
+        .cloned()
+        .collect::<HashSet<String>>()
 }
 
-fn construct_contigs(kmers: &HashSet<String>, num_threads: usize) -> Vec<String> {
+fn construct_contigs(
+    kmers: &HashSet<String>,
+    min_length: usize,
+    num_threads: usize,
+) -> Vec<String> {
     // Separate start, intermediate, and end nodes
-    let mut start_nodes: Vec<String> = Vec::new();
-    let mut end_nodes: Vec<String> = Vec::new();
-    let mut intermediate_nodes: Vec<String> = Vec::new();
-    for kmer in kmers {
-        if kmer.starts_with('^') {
-            start_nodes.push(kmer.clone());
-        } else if kmer.ends_with('$') {
-            end_nodes.push(kmer.clone());
-        } else {
-            intermediate_nodes.push(kmer.clone());
+    let (start_nodes, end_nodes, intermediate_nodes): (Vec<_>, Vec<_>, HashSet<_>) = {
+        let mut start_nodes = Vec::new();
+        let mut end_nodes = Vec::new();
+        let mut intermediate_nodes = HashSet::new();
+        for kmer in kmers {
+            if kmer.starts_with('^') {
+                start_nodes.push(kmer.clone());
+            } else if kmer.ends_with('$') {
+                end_nodes.push(kmer.clone());
+            } else {
+                intermediate_nodes.insert(kmer.clone());
+            }
         }
-    }
+        (start_nodes, end_nodes, intermediate_nodes)
+    };
     // Shared data structures for threads
     let all_contigs = Arc::new(RwLock::new(Vec::new()));
-    let progress = Arc::new(AtomicUsize::new(0)); // Progress tracker
+    let progress = Arc::new(AtomicUsize::new(0));
     let total_start_nodes = start_nodes.len();
+    let end_nodes = Arc::new(end_nodes);
+    // Define chunk size for start nodes
+    let chunk_size = 10; // Process 10 start nodes per sub-chunk
     let start_node_chunks: Vec<_> = start_nodes
-        .chunks((total_start_nodes + num_threads - 1) / num_threads)
+        .chunks(chunk_size)
         .map(|chunk| chunk.to_vec())
         .collect();
-    let end_nodes = Arc::new(end_nodes);
-    let mut handles = Vec::new();
+    // Process each chunk with thread-based sub-chunking
     for chunk in start_node_chunks {
-        let all_contigs = Arc::clone(&all_contigs);
-        let end_nodes = Arc::clone(&end_nodes);
-        let local_intermediate_nodes = intermediate_nodes.clone();
-        let progress = Arc::clone(&progress);
-        let handle = thread::spawn(move || {
-            let mut local_contigs = Vec::new();
-            for (_, start_node) in chunk.iter().enumerate() {
-                let mut current_paths = vec![start_node.clone()]; // Initialize with the current start node
-                let mut remaining_nodes = local_intermediate_nodes.clone(); // Local Vec for thread
-                while !current_paths.is_empty() {
-                    let mut new_paths = Vec::new(); // For branching paths
-                    for path in current_paths {
-                        // Get the last kmer in the current path (strip '^')
-                        let last_kmer = path.trim_start_matches('^');
-                        // Find matching nodes based on overlap
-                        let mut matches = Vec::new();
-                        for node in remaining_nodes.iter().chain(end_nodes.iter()) {
-                            let overlap_length = if end_nodes.contains(node) {
-                                node.len() - 2 // End nodes have a shorter overlap
-                            } else {
-                                node.len() - 1
-                            };
-                            if last_kmer.ends_with(&node[..overlap_length]) {
-                                matches.push(node.clone());
+        let chunk_len = chunk.len();
+        let sub_chunks: Vec<_> = if chunk_len < num_threads {
+            vec![chunk.to_vec()] // Use the chunk as-is if it's smaller than num_threads
+        } else {
+            chunk
+                .chunks((chunk_len + num_threads - 1) / num_threads)
+                .map(|sub_chunk| sub_chunk.to_vec())
+                .collect()
+        };
+        let mut handles = Vec::new();
+        // Spawn threads for each sub-chunk
+        for sub_chunk in sub_chunks {
+            let all_contigs = Arc::clone(&all_contigs);
+            let end_nodes = Arc::clone(&end_nodes);
+            let local_intermediate_nodes = intermediate_nodes.clone();
+            let progress = Arc::clone(&progress);
+            let handle = thread::spawn(move || {
+                let mut local_contigs = Vec::new();
+                for start_node in sub_chunk {
+                    let mut current_paths = vec![start_node]; // Initialize paths with the start node
+                    let mut remaining_nodes = local_intermediate_nodes.clone();
+                    while !current_paths.is_empty() {
+                        let mut new_paths = Vec::new();
+                        for path in current_paths {
+                            let last_kmer = path.trim_start_matches('^'); // Get suffix of the current path
+                            let mut matches = Vec::new();
+                            // Find matching nodes based on overlap
+                            for node in remaining_nodes.iter().chain(end_nodes.iter()) {
+                                let overlap_length = if end_nodes.contains(node) {
+                                    node.len() - 2 // Shorter overlap for end nodes
+                                } else {
+                                    node.len() - 1 // Full overlap for intermediate nodes
+                                };
+                                if last_kmer.ends_with(&node[..overlap_length]) {
+                                    matches.push(node.clone());
+                                }
+                            }
+                            // Extend the path for each match
+                            for matched_node in matches {
+                                if end_nodes.contains(&matched_node) {
+                                    let mut new_contig = path.clone();
+                                    new_contig.push_str(&matched_node[matched_node.len() - 2..]);
+                                    local_contigs.push(new_contig);
+                                } else {
+                                    let mut extended_path = path.clone();
+                                    extended_path.push_str(&matched_node[matched_node.len() - 1..]);
+                                    new_paths.push(extended_path);
+                                    remaining_nodes.remove(&matched_node);
+                                }
                             }
                         }
-                        // Process matches
-                        for matched_node in matches {
-                            if end_nodes.contains(&matched_node) {
-                                // Finalize the path if it's an end node
-                                let mut new_contig = path.clone();
-                                new_contig.push_str(&matched_node[matched_node.len() - 2..]);
-                                local_contigs.push(new_contig);
-                            } else {
-                                // Extend the path with intermediate nodes
-                                let mut extended_path = path.clone();
-                                extended_path.push_str(&matched_node[matched_node.len() - 1..]);
-                                new_paths.push(extended_path);
-                                // Remove the used intermediate node
-                                remaining_nodes.retain(|n| n != &matched_node);
-                            }
-                        }
+                        current_paths = new_paths;
                     }
-                    // Update the current paths with the new paths
-                    current_paths = new_paths;
+                    // Update progress
+                    let current_progress = progress.fetch_add(1, Ordering::Relaxed) + 1;
+                    if current_progress % 10 == 0 || current_progress == total_start_nodes {
+                        println!(
+                            "Progress: {}% ({}/{}) contigs processed",
+                            (current_progress * 100) / total_start_nodes,
+                            format_with_delimiters(current_progress),
+                            format_with_delimiters(total_start_nodes)
+                        );
+                    }
                 }
-                // Update progress
-                let current_progress = progress.fetch_add(1, Ordering::Relaxed) + 1;
-                let approximate_progress = ((current_progress * 100) / total_start_nodes).min(100); // Prevent over 100%
-                if current_progress % 10 == 0 || current_progress == total_start_nodes {
-                    println!(
-                        "Progress: {}% ({}/{}) contigs processed",
-                        approximate_progress, current_progress, total_start_nodes
-                    );
-                }
-            }
-            // Write local results to the shared contigs
-            let mut global_contigs = all_contigs.write().unwrap();
-            global_contigs.extend(local_contigs);
-        });
-        handles.push(handle);
+                let mut global_contigs = all_contigs.write().unwrap();
+                global_contigs.extend(local_contigs);
+            });
+            handles.push(handle);
+        }
+        // Wait for threads to finish processing sub-chunks
+        for handle in handles {
+            handle.join().unwrap();
+        }
     }
-    // Wait for threads to finish
-    for handle in handles {
-        handle.join().unwrap();
-    }
-    // Filter valid contigs (must start with "^" and end with "$")
+    // Extract valid contigs
     let global_contigs = all_contigs.read().unwrap();
     global_contigs
         .iter()
-        .cloned()
-        .filter(|c| c.starts_with('^') && c.ends_with('$'))
+        .filter(|c| c.starts_with('^') && c.ends_with('$') && c.len() > min_length + 2)
         .map(|c| c.trim_matches(&['^', '$']).to_string())
         .collect()
+}
+
+fn format_with_delimiters(number: usize) -> String {
+    let num_str = number.to_string();
+    let mut formatted = String::new();
+    let mut count = 0;
+    for ch in num_str.chars().rev() {
+        if count > 0 && count % 3 == 0 {
+            formatted.push(',');
+        }
+        formatted.push(ch);
+        count += 1;
+    }
+    formatted.chars().rev().collect()
 }
 
 fn main() -> io::Result<()> {
@@ -356,8 +402,9 @@ fn main() -> io::Result<()> {
             .unwrap_or(4),
     );
     let raw_sequences = read_sequences_to_raw(input_file, FileType::from_filename(&input_file)?)?;
+    let min_length = raw_sequences.iter().map(|seq| seq.len()).min().unwrap();
     let graph = build_global_graph(raw_sequences, k, num_threads);
-    let contigs = construct_contigs(&graph, num_threads);
+    let contigs = construct_contigs(&graph, min_length, num_threads);
     write_contigs_to_file(&contigs, output_file)?;
     Ok(())
 }
