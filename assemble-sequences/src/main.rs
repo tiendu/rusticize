@@ -131,13 +131,14 @@ fn write_contigs_to_file(sequences: &[String], file_path: &str) -> io::Result<()
 }
 
 fn build_local_graph(sequences: &[String], k: usize) -> HashSet<String> {
-    let mut local_graph = HashSet::<String>::new();
+    let mut local_graph = HashMap::<u64, String>::new(); // Map hashes to k-mers
     for sequence in sequences {
-        if sequence.len() < k {
+        if sequence.len() <= k {
             continue; // Skip sequences shorter than k
         }
         for i in 0..=sequence.len() - k {
             let kmer = &sequence[i..i + k];
+            let hash = hash_string(kmer); // Compute the hash of the raw k-mer
             let annotated_kmer = if i == 0 {
                 format!("^{}", kmer) // Start node
             } else if i + k == sequence.len() {
@@ -146,25 +147,26 @@ fn build_local_graph(sequences: &[String], k: usize) -> HashSet<String> {
                 kmer.to_string() // Intermediate node
             };
             // Resolve conflicts locally
-            if let Some(existing_kmer) = local_graph
-                .iter()
-                .cloned()
-                .find(|local_kmer| local_kmer.trim_matches(&['^', '$']) == kmer)
-            {
-                if existing_kmer.contains('^') || existing_kmer.contains('$') {
-                    local_graph.remove(&existing_kmer);
-                    if annotated_kmer.contains('^') || annotated_kmer.contains('$') {
-                        local_graph.insert(kmer.to_string());
-                    } else {
-                        local_graph.insert(annotated_kmer);
+            match local_graph.get(&hash) {
+                Some(existing_kmer) => {
+                    if existing_kmer.contains('^') || existing_kmer.contains('$') {
+                        // Annotated version exists
+                        if annotated_kmer.contains('^') || annotated_kmer.contains('$') {
+                            local_graph.insert(hash, kmer.to_string()); // Prefer unannotated
+                        } else {
+                            local_graph.insert(hash, annotated_kmer); // Replace with new annotation
+                        }
                     }
                 }
-            } else {
-                local_graph.insert(annotated_kmer);
+                None => {
+                    // No existing k-mer; insert new one
+                    local_graph.insert(hash, annotated_kmer);
+                }
             }
         }
     }
-    local_graph
+    // Extract the values from the map as a HashSet
+    local_graph.into_values().collect::<HashSet<String>>()
 }
 
 fn build_global_graph(sequences: Vec<String>, k: usize, num_threads: usize) -> HashSet<String> {
@@ -173,7 +175,7 @@ fn build_global_graph(sequences: Vec<String>, k: usize, num_threads: usize) -> H
         .chunks(chunk_size)
         .map(|chunk| chunk.to_vec())
         .collect();
-    let global_graph = Arc::new(RwLock::new(HashSet::<String>::new()));
+    let global_graph = Arc::new(RwLock::new(HashMap::<u64, String>::new()));
     let progress = Arc::new(AtomicUsize::new(0));
     let total_sequences = sequences.len();
     let mut handles = Vec::new();
@@ -184,23 +186,20 @@ fn build_global_graph(sequences: Vec<String>, k: usize, num_threads: usize) -> H
             let local_graph = build_local_graph(&chunk, k); // Generate local k-mers
             let mut global_graph_lock = global_graph_clone.write().unwrap();
             for local_kmer in local_graph {
-                let raw_local_kmer = local_kmer.trim_matches(&['^', '$']).to_string();
-                if let Some(existing_kmer) = global_graph_lock
-                    .iter()
-                    .cloned()
-                    .find(|global_kmer| global_kmer.trim_matches(&['^', '$']) == raw_local_kmer)
-                {
-                    // Resolve conflict if annotations differ
-                    if existing_kmer.contains('^') || existing_kmer.contains('$') {
-                        global_graph_lock.remove(&existing_kmer);
-                        if local_kmer.contains('^') || local_kmer.contains('$') {
-                            global_graph_lock.insert(raw_local_kmer);
-                        } else {
-                            global_graph_lock.insert(local_kmer);
+                let raw_local_kmer = local_kmer.trim_matches(&['^', '$']);
+                let hash = hash_string(raw_local_kmer);
+                match global_graph_lock.get(&hash) {
+                    Some(existing_kmer) => {
+                        // Resolve conflict if annotations differ
+                        if existing_kmer.contains('^') || existing_kmer.contains('$') {
+                            if local_kmer.contains('^') || local_kmer.contains('$') {
+                                global_graph_lock.insert(hash, raw_local_kmer.to_string());
+                            }
                         }
                     }
-                } else {
-                    global_graph_lock.insert(local_kmer);
+                    None => {
+                        global_graph_lock.insert(hash, local_kmer);
+                    }
                 }
             }
             // Update progress
@@ -218,9 +217,9 @@ fn build_global_graph(sequences: Vec<String>, k: usize, num_threads: usize) -> H
     for handle in handles {
         handle.join().unwrap();
     }
-    // Return the final global graph
+    // Extract the values from the map as a HashSet
     let global_graph_lock = global_graph.read().unwrap();
-    global_graph_lock.clone()
+    global_graph_lock.values().cloned().collect::<HashSet<String>>()
 }
 
 fn construct_contigs(kmers: &HashSet<String>, num_threads: usize) -> Vec<String> {
