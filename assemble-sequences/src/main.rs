@@ -117,7 +117,7 @@ fn read_sequences_to_raw(file_path: &str, file_type: FileType) -> io::Result<Vec
         .collect())
 }
 
-fn write_contigs_to_file(sequences: &[String], file_path: &str) -> io::Result<()> {
+fn write_contigs_to_file(sequences: [String], file_path: &str) -> io::Result<()> {
     let file = File::create(file_path)?;
     let mut writer: Box<dyn Write> = if file_path.ends_with(".gz") {
         Box::new(GzEncoder::new(file, Compression::default()))
@@ -234,7 +234,7 @@ fn build_global_graph(sequences: Vec<String>, k: usize, num_threads: usize) -> H
 }
 
 fn construct_contigs(
-    kmers: &HashSet<String>,
+    kmers: HashSet<String>,
     min_length: usize,
     num_threads: usize,
 ) -> Vec<String> {
@@ -379,7 +379,7 @@ fn main() -> io::Result<()> {
     let raw_sequences = read_sequences_to_raw(input_file, FileType::from_filename(&input_file)?)?;
     let min_length = raw_sequences.iter().map(|seq| seq.len()).min().unwrap();
     let graph = build_global_graph(raw_sequences, k, num_threads);
-    let contigs = construct_contigs(&graph, min_length, num_threads);
-    write_contigs_to_file(&contigs, output_file)?;
+    let contigs = construct_contigs(graph, min_length, num_threads);
+    write_contigs_to_file(contigs, output_file)?;
     Ok(())
 }
