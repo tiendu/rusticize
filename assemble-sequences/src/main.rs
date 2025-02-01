@@ -130,7 +130,7 @@ fn write_contigs_to_file(sequences: Vec<String>, file_path: &str) -> io::Result<
     Ok(())
 }
 
-fn build_local_graph(sequences: &[String], k: usize) -> HashSet<String> {
+fn build_local_graph(sequences: Vec<String>, k: usize) -> HashSet<String> {
     let mut local_graph = HashMap::<u64, String>::new(); // Map hashes to k-mers
     for sequence in sequences {
         if sequence.len() <= k {
@@ -189,7 +189,8 @@ fn build_global_graph(sequences: Vec<String>, k: usize, num_threads: usize) -> H
             let global_graph_clone = Arc::clone(&global_graph);
             let progress = Arc::clone(&progress);
             let handle = thread::spawn(move || {
-                let local_graph = build_local_graph(&sub_chunk, k); // Generate local k-mers
+                let sub_chunk_len = sub_chunk.len();
+                let local_graph = build_local_graph(sub_chunk, k); // Generate local k-mers
                 let mut global_graph_lock = global_graph_clone.write().unwrap();
                 for local_kmer in local_graph {
                     let raw_local_kmer = local_kmer.trim_matches(&['^', '$']);
@@ -208,9 +209,8 @@ fn build_global_graph(sequences: Vec<String>, k: usize, num_threads: usize) -> H
                     }
                 }
                 // Update progress
-                let processed_sequences = sub_chunk.len();
-                let current_progress = progress.fetch_add(processed_sequences, Ordering::Relaxed)
-                    + processed_sequences;
+                let current_progress =
+                    progress.fetch_add(sub_chunk_len, Ordering::Relaxed) + sub_chunk_len;
                 let approximate_progress = (current_progress * 100) / total_sequences;
                 println!(
                     "Progress: {}% ({}/{}) sequences processed",
