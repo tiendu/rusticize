@@ -7,7 +7,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc, Mutex, RwLock
+    Arc, Mutex, RwLock,
 };
 use std::thread;
 
@@ -233,11 +233,7 @@ fn build_global_graph(sequences: Vec<String>, k: usize, num_threads: usize) -> H
         .collect::<HashSet<String>>()
 }
 
-fn construct_contigs(
-    kmers: HashSet<String>,
-    min_length: usize,
-    num_threads: usize,
-) -> Vec<String> {
+fn construct_contigs(kmers: HashSet<String>, min_length: usize, num_threads: usize) -> Vec<String> {
     let (start_nodes, end_nodes, intermediate_nodes): (Vec<_>, Vec<_>, HashSet<_>) = {
         let mut start_nodes = Vec::new();
         let mut end_nodes = Vec::new();
