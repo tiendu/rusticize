@@ -117,7 +117,7 @@ fn read_sequences_to_raw(file_path: &str, file_type: FileType) -> io::Result<Vec
         .collect())
 }
 
-fn write_contigs_to_file(sequences: [String], file_path: &str) -> io::Result<()> {
+fn write_contigs_to_file(sequences: Vec<String>, file_path: &str) -> io::Result<()> {
     let file = File::create(file_path)?;
     let mut writer: Box<dyn Write> = if file_path.ends_with(".gz") {
         Box::new(GzEncoder::new(file, Compression::default()))
