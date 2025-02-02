@@ -130,87 +130,185 @@ fn write_contigs_to_file(sequences: Vec<String>, file_path: &str) -> io::Result<
     Ok(())
 }
 
-fn build_local_graph(sequences: Vec<String>, k: usize) -> HashSet<String> {
-    let mut local_graph = HashMap::<u64, String>::new(); // Map hashes to k-mers
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct KmerCompact {
+    bits: u128, // Bit-packed k-mer.
+    k: u8, // k-mer length.
+    is_start: bool,
+    is_end: bool,
+}
+
+impl KmerCompact {
+    /// Convert the compact k-mer back into a String, adding annotations if needed.
+    fn to_string(&self) -> String {
+        let mut s = String::with_capacity(self.k as usize);
+        // Decode each nucleotide (2 bits per nucleotide).
+        for i in 0..(self.k as usize) {
+            let shift = 2 * (self.k as usize - i - 1);
+            let code = (self.bits >> shift) & 0b11;
+            let ch = match code {
+                0 => 'A',
+                1 => 'C',
+                2 => 'G',
+                3 => 'T',
+                _ => 'N',
+            };
+            s.push(ch);
+        }
+        // Add annotations if this k-mer is at a sequence boundary.
+        if self.is_start {
+            s = format!("^{}", s);
+        }
+        if self.is_end {
+            s.push('$');
+        }
+        s
+    }
+}
+
+/// Encodes a DNA k-mer string into a bit-packed u128.
+/// Returns None if an invalid character is encountered.
+fn encode_kmer(kmer: &str) -> Option<u128> {
+    let mut bits: u128 = 0;
+    for ch in kmer.chars() {
+        bits <<= 2;
+        bits |= match ch {
+            'A' | 'a' => 0,
+            'C' | 'c' => 1,
+            'G' | 'g' => 2,
+            'T' | 't' => 3,
+            _ => return None,
+        };
+    }
+    Some(bits)
+}
+
+/// Estimates the total number of k-mers that will be extracted from the sequences.
+fn estimate_kmer_count(sequences: &[String], k: usize) -> usize {
+    sequences
+        .iter()
+        .map(|s| if s.len() > k { s.len() - k + 1 } else { 0 })
+        .sum()
+}
+
+fn build_local_graph(sequences: &[String], k: usize) -> HashSet<KmerCompact> {
+    // Estimate the capacity to reduce reallocation.
+    let estimated_capacity = estimate_kmer_count(sequences, k);
+    let mut local_graph = HashMap::<u128, KmerCompact>::with_capacity(estimated_capacity);
+    // Iterate over each sequence.
     for sequence in sequences {
         if sequence.len() <= k {
-            continue; // Skip sequences shorter than k
+            continue; // Skip sequences that are too short.
         }
+        // Slide a window of length k over the sequence.
         for i in 0..=sequence.len() - k {
-            let kmer = &sequence[i..i + k];
-            let hash = hash_string(kmer); // Compute the hash of the raw k-mer
-            let annotated_kmer = if i == 0 {
-                format!("^{}", kmer) // Start node
-            } else if i + k == sequence.len() {
-                format!("{}$", kmer) // End node
-            } else {
-                kmer.to_string() // Intermediate node
-            };
-            // Resolve conflicts locally
-            match local_graph.get(&hash) {
-                Some(existing_kmer) => {
-                    if existing_kmer.contains('^') || existing_kmer.contains('$') {
-                        // Prefer unannotated k-mer if present
-                        local_graph.insert(hash, kmer.to_string());
+            let kmer_slice = &sequence[i..i + k];
+            if let Some(raw_bits) = encode_kmer(kmer_slice) {
+                let is_start = i == 0;
+                let is_end = i + k == sequence.len();
+                let kmer_compact = KmerCompact {
+                    bits: raw_bits,
+                    k: k as u8,
+                    is_start,
+                    is_end,
+                };
+                // If a k-mer is already present but annotated, replace it with the unannotated version.
+                match local_graph.get(&raw_bits) {
+                    Some(existing) => {
+                        if existing.is_start || existing.is_end {
+                            let unannotated = KmerCompact {
+                                bits: raw_bits,
+                                k: k as u8,
+                                is_start: false,
+                                is_end: false,
+                            };
+                            local_graph.insert(raw_bits, unannotated);
+                        }
                     }
-                }
-                None => {
-                    // No existing k-mer; insert the annotated one
-                    local_graph.insert(hash, annotated_kmer);
+                    None => {
+                        local_graph.insert(raw_bits, kmer_compact);
+                    }
                 }
             }
         }
     }
-    // Extract the values from the map as a HashSet
-    local_graph.into_values().collect::<HashSet<String>>()
+    local_graph.into_values().collect()
 }
 
-fn build_global_graph(sequences: Vec<String>, k: usize, num_threads: usize) -> HashSet<String> {
+fn build_global_graph(
+    sequences: Vec<String>,
+    k: usize,
+    num_threads: usize,
+) -> HashSet<KmerCompact> {
     let chunk_size = 10_000;
-    let sequence_chunks: Vec<_> = sequences
-        .chunks(chunk_size)
-        .map(|chunk| chunk.to_vec())
-        .collect();
-    let global_graph = Arc::new(RwLock::new(HashMap::<u64, String>::new()));
+    let sequences_arc = Arc::new(sequences);
+    let total_sequences = sequences_arc.len();
+    // Create index ranges for chunks.
+    let mut chunk_ranges = Vec::new();
+    let mut start = 0;
+    while start < total_sequences {
+        let end = std::cmp::min(start + chunk_size, total_sequences);
+        chunk_ranges.push((start, end));
+        start = end;
+    }
+    // Global graph shared across threads.
+    let global_graph = Arc::new(RwLock::new(HashMap::<u128, KmerCompact>::new()));
     let progress = Arc::new(AtomicUsize::new(0));
-    let total_sequences = sequences.len();
-    for chunk in sequence_chunks {
-        let chunk_len = chunk.len();
-        let sub_chunks: Vec<_> = if chunk_len < num_threads {
-            vec![chunk.to_vec()] // Keep the original chunk as is
+    // Process each chunk.
+    for (chunk_start, chunk_end) in chunk_ranges {
+        let chunk_len = chunk_end - chunk_start;
+        // Partition the current chunk into sub-chunks.
+        let mut subchunk_ranges = Vec::new();
+        if chunk_len < num_threads {
+            subchunk_ranges.push((chunk_start, chunk_end));
         } else {
-            chunk
-                .chunks((chunk_len + num_threads - 1) / num_threads)
-                .map(|sub_chunk| sub_chunk.to_vec())
-                .collect()
-        };
+            let sub_chunk_size = (chunk_len + num_threads - 1) / num_threads;
+            let mut sub_start = chunk_start;
+            while sub_start < chunk_end {
+                let sub_end = std::cmp::min(sub_start + sub_chunk_size, chunk_end);
+                subchunk_ranges.push((sub_start, sub_end));
+                sub_start = sub_end;
+            }
+        }
         let mut handles = Vec::new();
-        for sub_chunk in sub_chunks {
+        // Spawn threads for each sub-chunk.
+        for (sub_start, sub_end) in subchunk_ranges {
+            let sequences_clone = Arc::clone(&sequences_arc);
             let global_graph_clone = Arc::clone(&global_graph);
-            let progress = Arc::clone(&progress);
+            let progress_clone = Arc::clone(&progress);
             let handle = thread::spawn(move || {
-                let sub_chunk_len = sub_chunk.len();
-                let local_graph = build_local_graph(sub_chunk, k); // Generate local k-mers
-                let mut global_graph_lock = global_graph_clone.write().unwrap();
-                for local_kmer in local_graph {
-                    let raw_local_kmer = local_kmer.trim_matches(&['^', '$']);
-                    let hash = hash_string(raw_local_kmer);
-                    match global_graph_lock.get(&hash) {
-                        Some(existing_kmer) => {
-                            // Resolve conflict if annotations differ
-                            if existing_kmer.contains('^') || existing_kmer.contains('$') {
-                                global_graph_lock.insert(hash, raw_local_kmer.to_string());
+                // Create a slice for the sub-chunk.
+                let sub_chunk = &sequences_clone[sub_start..sub_end];
+                // Build the local graph for this sub-chunk.
+                let local_graph = build_local_graph(sub_chunk, k);
+                {
+                    // Merge local k-mers into the global graph.
+                    let mut global_lock = global_graph_clone.write().unwrap();
+                    for kmer in local_graph {
+                        let raw_bits = kmer.bits;
+                        match global_lock.get(&raw_bits) {
+                            Some(existing) => {
+                                if existing.is_start || existing.is_end {
+                                    // Replace with unannotated version.
+                                    let unannotated = KmerCompact {
+                                        bits: raw_bits,
+                                        k: kmer.k,
+                                        is_start: false,
+                                        is_end: false,
+                                    };
+                                    global_lock.insert(raw_bits, unannotated);
+                                }
                             }
-                        }
-                        None => {
-                            // Insert the k-mer directly to the global graph
-                            global_graph_lock.insert(hash, local_kmer);
+                            None => {
+                                global_lock.insert(raw_bits, kmer);
+                            }
                         }
                     }
                 }
-                // Update progress
+                // Update and print progress.
+                let sub_chunk_len = sub_end - sub_start;
                 let current_progress =
-                    progress.fetch_add(sub_chunk_len, Ordering::Relaxed) + sub_chunk_len;
+                    progress_clone.fetch_add(sub_chunk_len, Ordering::Relaxed) + sub_chunk_len;
                 let approximate_progress = (current_progress * 100) / total_sequences;
                 println!(
                     "Progress: {}% ({}/{}) sequences processed",
@@ -221,24 +319,29 @@ fn build_global_graph(sequences: Vec<String>, k: usize, num_threads: usize) -> H
             });
             handles.push(handle);
         }
+        // Wait for all threads in this chunk.
         for handle in handles {
             handle.join().unwrap();
         }
     }
-    // Extract the values from the map as a HashSet
+    // Return the global graph as a HashSet.
     let global_graph_lock = global_graph.read().unwrap();
-    global_graph_lock
-        .values()
-        .cloned()
-        .collect::<HashSet<String>>()
+    global_graph_lock.values().cloned().collect()
 }
 
-fn construct_contigs(kmers: HashSet<String>, min_length: usize, num_threads: usize) -> Vec<String> {
-    let (start_nodes, end_nodes, intermediate_nodes): (Vec<_>, Vec<_>, HashSet<_>) = {
+fn construct_contigs(
+    kmers: HashSet<KmerCompact>,
+    min_length: usize,
+    num_threads: usize,
+) -> Vec<String> {
+    // Convert the compact k-mers to Strings.
+    let kmers_str: HashSet<String> = kmers.into_iter().map(|k| k.to_string()).collect();
+    // Separate nodes into start, end, and intermediate.
+    let (start_nodes, end_nodes, intermediate_nodes): (Vec<String>, Vec<String>, HashSet<String>) = {
         let mut start_nodes = Vec::new();
         let mut end_nodes = Vec::new();
         let mut intermediate_nodes = HashSet::new();
-        for kmer in kmers {
+        for kmer in kmers_str {
             if kmer.starts_with('^') {
                 start_nodes.push(kmer.clone());
             } else if kmer.ends_with('$') {
@@ -249,9 +352,11 @@ fn construct_contigs(kmers: HashSet<String>, min_length: usize, num_threads: usi
         }
         (start_nodes, end_nodes, intermediate_nodes)
     };
+    // Shared vector to collect contigs.
     let all_contigs = Arc::new(RwLock::new(Vec::new()));
     let progress = Arc::new(AtomicUsize::new(0));
     let total_start_nodes = start_nodes.len();
+    // Build a suffix map: map from an overlap to nodes having that suffix.
     let suffix_map: HashMap<String, Vec<String>> = {
         let mut map = HashMap::<String, Vec<String>>::new();
         for node in intermediate_nodes.iter().chain(end_nodes.iter()) {
@@ -265,32 +370,37 @@ fn construct_contigs(kmers: HashSet<String>, min_length: usize, num_threads: usi
         }
         map
     };
+    // Partition start nodes for parallel processing.
     let chunk_size = (total_start_nodes + num_threads - 1) / num_threads;
-    let start_node_chunks: Vec<_> = start_nodes
+    let start_node_chunks: Vec<Vec<String>> = start_nodes
         .chunks(chunk_size)
         .map(|chunk| chunk.to_vec())
         .collect();
     let mut handles = Vec::new();
     for chunk in start_node_chunks {
-        let all_contigs = Arc::clone(&all_contigs);
+        let all_contigs_clone = Arc::clone(&all_contigs);
         let suffix_map = Arc::new(Mutex::new(suffix_map.clone()));
-        let progress = Arc::clone(&progress);
+        let progress_clone = Arc::clone(&progress);
         let handle = thread::spawn(move || {
             let mut local_contigs = Vec::new();
             for start_node in chunk {
                 let mut current_paths = vec![start_node.clone()];
+                // Extend paths until no further extension is possible.
                 while !current_paths.is_empty() {
                     let mut new_paths = Vec::new();
                     for path in current_paths {
                         let last_kmer = path.trim_start_matches('^');
+                        // Calculate the overlap key.
                         let suffix_key = &last_kmer[path.len() - start_node.len() + 1..];
                         if let Some(matches) = suffix_map.lock().unwrap().get_mut(suffix_key) {
                             for matched_node in matches.drain(..) {
                                 if matched_node.ends_with('$') {
+                                    // End node: complete contig.
                                     let mut new_contig = path.clone();
                                     new_contig.push_str(&matched_node[matched_node.len() - 2..]);
                                     local_contigs.push(new_contig);
                                 } else {
+                                    // Intermediate: extend the current path.
                                     let mut extended_path = path.clone();
                                     extended_path.push_str(&matched_node[matched_node.len() - 1..]);
                                     new_paths.push(extended_path);
@@ -300,7 +410,8 @@ fn construct_contigs(kmers: HashSet<String>, min_length: usize, num_threads: usi
                     }
                     current_paths = new_paths;
                 }
-                let current_progress = progress.fetch_add(1, Ordering::Relaxed) + 1;
+                // Update progress for contig construction.
+                let current_progress = progress_clone.fetch_add(1, Ordering::Relaxed) + 1;
                 if current_progress % 10 == 0 || current_progress == total_start_nodes {
                     println!(
                         "Progress: {}% ({}/{}) contigs processed",
@@ -310,19 +421,22 @@ fn construct_contigs(kmers: HashSet<String>, min_length: usize, num_threads: usi
                     );
                 }
             }
-            let mut global_contigs = all_contigs.write().unwrap();
+            // Merge local contigs into the global vector.
+            let mut global_contigs = all_contigs_clone.write().unwrap();
             global_contigs.extend(local_contigs);
         });
         handles.push(handle);
     }
+    // Wait for all contig construction threads.
     for handle in handles {
         handle.join().unwrap();
     }
+    // Filter and return only valid contigs.
     let global_contigs = all_contigs.read().unwrap();
     global_contigs
         .iter()
         .filter(|c| c.starts_with('^') && c.ends_with('$') && c.len() > min_length + 2)
-        .map(|c| c.trim_matches(&['^', '$']).to_string())
+        .map(|c| c.trim_matches(&['^', '$'][..]).to_string())
         .collect()
 }
 
