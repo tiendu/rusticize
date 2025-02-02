@@ -334,7 +334,7 @@ fn construct_contigs(
     min_length: usize,
     num_threads: usize,
 ) -> Option<Vec<String>> {
-    // Convert the compact k–mers to Strings.
+    // Convert the compact k–mers to annotated Strings.
     let kmers_str: HashSet<String> = kmers.into_iter().map(|k| k.to_string()).collect();
     // Partition nodes into start, end, and intermediate.
     let (start_nodes, end_nodes, intermediate_nodes): (Vec<String>, Vec<String>, HashSet<String>) = {
@@ -352,10 +352,11 @@ fn construct_contigs(
         }
         (start_nodes, end_nodes, intermediate_nodes)
     };
-    // Determine the total number of start nodes (for progress reporting).
+    // Total number of start nodes for progress reporting.
     let total_start_nodes = start_nodes.len();
     // Build a suffix map for intermediate and end nodes.
-    // Each key is the overlap (k-1 nucleotides for intermediate nodes or k-2 for end nodes).
+    // For intermediate nodes, the key is the last (k-1) nucleotides;
+    // for end nodes, it is the last (k-2) nucleotides.
     let suffix_map: HashMap<String, Vec<String>> = {
         let mut map = HashMap::<String, Vec<String>>::new();
         for node in intermediate_nodes.iter().chain(end_nodes.iter()) {
@@ -369,89 +370,100 @@ fn construct_contigs(
         }
         map
     };
-    // Create a temporary file in the system's temp directory to store contigs.
-    let temp_file_path = env::temp_dir().join("contigs_temp.txt");
+    // Create a temporary file to store intermediate contigs.
+    let temp_file_path = std::env::temp_dir().join("contigs_temp.txt");
     let temp_file =
         File::create(&temp_file_path).expect("Unable to create temporary file for contigs");
-    // Wrap the file in an Arc<Mutex<>> so that threads can safely write to it.
     let all_contigs_file = Arc::new(Mutex::new(BufWriter::new(temp_file)));
-    // Partition start nodes for parallel processing.
-    let chunk_size = (total_start_nodes + num_threads - 1) / num_threads;
+    let chunk_size = 20;
     let start_node_chunks: Vec<Vec<String>> = start_nodes
         .chunks(chunk_size)
         .map(|chunk| chunk.to_vec())
         .collect();
+    // Atomic counter for progress reporting.
     let progress = Arc::new(AtomicUsize::new(0));
     let mut handles = Vec::new();
-    // Spawn a thread for each chunk of start nodes.
     for chunk in start_node_chunks {
-        // Clone shared resources for the thread.
-        let all_contigs_file = Arc::clone(&all_contigs_file);
-        let suffix_map = Arc::new(Mutex::new(suffix_map.clone()));
-        let progress_clone = Arc::clone(&progress);
-        let handle = thread::spawn(move || {
-            // Each thread accumulates its local contigs in a vector.
-            let mut local_contigs = Vec::new();
-            for start_node in chunk {
-                // Begin with the start node as the initial path.
-                let mut current_paths = vec![start_node.clone()];
-                // Extend paths until no more extensions are possible.
-                while !current_paths.is_empty() {
-                    let mut new_paths = Vec::new();
-                    for path in current_paths {
-                        // Remove start annotation (if any) for overlap matching.
-                        let last_kmer = path.trim_start_matches('^');
-                        // Derive a key from the overlap.
-                        // Here we use the last (start_node.len() - 1) characters of the current path.
-                        let key_index = if path.len() >= start_node.len() {
-                            path.len() - start_node.len() + 1
-                        } else {
-                            0
-                        };
-                        let suffix_key = &last_kmer[key_index..];
-                        // Look up matching nodes in the suffix map.
-                        if let Some(matches) = suffix_map.lock().unwrap().get_mut(suffix_key) {
-                            for matched_node in matches.drain(..) {
-                                if matched_node.ends_with('$') {
-                                    // If matched node is an end node, complete the contig.
-                                    let mut new_contig = path.clone();
-                                    new_contig.push_str(&matched_node[matched_node.len() - 2..]);
-                                    local_contigs.push(new_contig);
-                                } else {
-                                    // Otherwise, extend the current path.
-                                    let mut extended_path = path.clone();
-                                    extended_path.push_str(&matched_node[matched_node.len() - 1..]);
-                                    new_paths.push(extended_path);
+        // For each chunk (of up to 20 nodes), further subdivide among threads.
+        let chunk_len = chunk.len();
+        // Calculate sub–chunk size per thread.
+        let sub_chunk_size = (chunk_len + num_threads - 1) / num_threads;
+        // Create sub–chunks from the current chunk.
+        let sub_chunks: Vec<Vec<String>> = chunk
+            .chunks(sub_chunk_size)
+            .map(|sub| sub.to_vec())
+            .collect();
+        // Spawn one thread per sub–chunk.
+        for sub_chunk in sub_chunks {
+            let all_contigs_file = Arc::clone(&all_contigs_file);
+            let suffix_map = Arc::new(Mutex::new(suffix_map.clone()));
+            let progress_clone = Arc::clone(&progress);
+            let handle = thread::spawn(move || {
+                // Each thread collects its local contigs.
+                let mut local_contigs = Vec::new();
+                for start_node in sub_chunk {
+                    // Begin with the start node as the initial path.
+                    let mut current_paths = vec![start_node.clone()];
+                    // Extend paths until no further extension is possible.
+                    while !current_paths.is_empty() {
+                        let mut new_paths = Vec::new();
+                        for path in current_paths {
+                            // For matching, remove the start annotation.
+                            let last_kmer = path.trim_start_matches('^');
+                            // Derive the key: using the last (start_node.len()-1) characters.
+                            let key_index = if path.len() >= start_node.len() {
+                                path.len() - start_node.len() + 1
+                            } else {
+                                0
+                            };
+                            let suffix_key = &last_kmer[key_index..];
+                            // Look up matching nodes in the suffix map.
+                            if let Some(matches) = suffix_map.lock().unwrap().get_mut(suffix_key) {
+                                for matched_node in matches.drain(..) {
+                                    if matched_node.ends_with('$') {
+                                        // End node: complete the contig.
+                                        let mut new_contig = path.clone();
+                                        new_contig
+                                            .push_str(&matched_node[matched_node.len() - 2..]);
+                                        local_contigs.push(new_contig);
+                                    } else {
+                                        // Intermediate node: extend the contig.
+                                        let mut extended_path = path.clone();
+                                        extended_path
+                                            .push_str(&matched_node[matched_node.len() - 1..]);
+                                        new_paths.push(extended_path);
+                                    }
                                 }
                             }
                         }
+                        current_paths = new_paths;
                     }
-                    current_paths = new_paths;
+                    // Update progress for each start node processed.
+                    let current_progress = progress_clone.fetch_add(1, Ordering::Relaxed) + 1;
+                    if current_progress % 10 == 0 || current_progress == total_start_nodes {
+                        println!(
+                            "Progress: {}% ({}/{}) contigs processed",
+                            (current_progress * 100) / total_start_nodes,
+                            format_with_delimiters(current_progress),
+                            format_with_delimiters(total_start_nodes)
+                        );
+                    }
                 }
-                // Update progress.
-                let current_progress = progress_clone.fetch_add(1, Ordering::Relaxed) + 1;
-                if current_progress % 10 == 0 || current_progress == total_start_nodes {
-                    println!(
-                        "Progress: {}% ({}/{}) contigs processed",
-                        (current_progress * 100) / total_start_nodes,
-                        format_with_delimiters(current_progress),
-                        format_with_delimiters(total_start_nodes)
-                    );
+                // Write this thread's local contigs to the temporary file.
+                let mut writer = all_contigs_file.lock().unwrap();
+                for contig in local_contigs {
+                    writeln!(writer, "{}", contig)
+                        .expect("Failed to write contig to temporary file");
                 }
-            }
-            // After processing, write the local contigs to the temporary file.
-            let mut file = all_contigs_file.lock().unwrap();
-            for contig in local_contigs {
-                writeln!(file, "{}", contig).expect("Failed to write contig to temporary file");
-            }
-        });
-        handles.push(handle);
+            });
+            handles.push(handle);
+        }
     }
     // Wait for all threads to finish.
     for handle in handles {
         handle.join().unwrap();
     }
-    // Flush and drop the writer so that data is written.
+    // Flush the writer so that all data is written.
     {
         let mut writer = all_contigs_file.lock().unwrap();
         writer.flush().expect("Failed to flush temporary file");
@@ -460,7 +472,7 @@ fn construct_contigs(
     let temp_file = File::open(&temp_file_path).ok()?;
     let reader = BufReader::new(temp_file);
     let mut filtered_contigs = Vec::new();
-    // Filter contigs by checking for valid annotations and minimum length.
+    // Filter contigs by valid annotations and minimum length.
     for line in reader.lines() {
         let contig = line.ok()?;
         if contig.starts_with('^') && contig.ends_with('$') && contig.len() > min_length + 2 {
