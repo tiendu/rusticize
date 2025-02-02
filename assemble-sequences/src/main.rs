@@ -522,6 +522,6 @@ fn main() -> io::Result<()> {
     let min_length = raw_sequences.iter().map(|seq| seq.len()).min().unwrap();
     let graph = build_global_graph(raw_sequences, k, num_threads);
     let contigs = construct_contigs(graph, min_length, num_threads);
-    write_contigs_to_file(contigs, output_file)?;
+    write_contigs_to_file(contigs.expect("No contigs!"), output_file)?;
     Ok(())
 }
